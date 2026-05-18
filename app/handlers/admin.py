@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.access import get_trial_config, now_utc, set_app_setting
 from app.config import settings
+from app.db import force_rub_payment_ui_texts
 from app.keyboards import (
     text_after_save_keyboard,
     text_category_keyboard,
@@ -984,6 +985,15 @@ async def tariffs_handler(message: Message, session: AsyncSession) -> None:
     ]
     tariff_text = "\n\n".join(tariff_blocks) or "Тарифы не настроены."
     await message.answer(tariff_text)
+
+
+@router.message(Command("force_rub_ui"))
+async def force_rub_ui_handler(message: Message, session: AsyncSession) -> None:
+    if not await require_tariff_admin(message, session):
+        return
+
+    await force_rub_payment_ui_texts(session)
+    await message.answer("Интерфейс оплаты обновлён на ₽ и карту.")
 
 
 @router.message(Command("admin_stats"))

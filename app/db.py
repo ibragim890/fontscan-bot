@@ -26,6 +26,73 @@ async_session_factory = async_sessionmaker(
 )
 
 
+async def force_rub_payment_ui_texts(db: Any) -> None:
+    from app.texts import DEFAULT_BOT_TEXTS, FORCED_TEXT_UPDATE_KEYS
+
+    now = datetime.now(timezone.utc)
+
+    for key in FORCED_TEXT_UPDATE_KEYS:
+        if key not in DEFAULT_BOT_TEXTS:
+            continue
+        title, text_value = DEFAULT_BOT_TEXTS[key]
+        await db.execute(
+            text(
+                "UPDATE bot_texts "
+                "SET title = :title, text = :new_text, updated_at = :updated_at "
+                "WHERE key = :key"
+            ),
+            {
+                "key": key,
+                "title": title,
+                "new_text": text_value,
+                "updated_at": now,
+            },
+        )
+
+    main_menu_title, main_menu_text = DEFAULT_BOT_TEXTS["main_menu"]
+    await db.execute(
+        text(
+            "UPDATE bot_texts "
+            "SET title = :title, text = :new_text, updated_at = :updated_at "
+            "WHERE key = :key"
+        ),
+        {
+            "key": "start_message",
+            "title": main_menu_title,
+            "new_text": main_menu_text,
+            "updated_at": now,
+        },
+    )
+
+    replacements = [
+        ("Telegram Stars", "Робокассу"),
+        ("99 Stars", "99 ₽"),
+        ("199 Stars", "199 ₽"),
+        (" Stars", " ₽"),
+        ("Stars", "₽"),
+    ]
+    for old_value, new_value in replacements:
+        result = await db.execute(
+            text(
+                "UPDATE bot_texts "
+                "SET text = replace(text, :old_value, :new_value), "
+                "updated_at = :updated_at "
+                "WHERE text LIKE :pattern"
+            ),
+            {
+                "old_value": old_value,
+                "new_value": new_value,
+                "updated_at": now,
+                "pattern": f"%{old_value}%",
+            },
+        )
+        logger.info(
+            "Bot text rub UI cleanup: old=%s rows=%s",
+            old_value,
+            result.rowcount,
+        )
+
+
 async def init_db() -> None:
     import app.models  # noqa: F401
 
@@ -151,60 +218,7 @@ async def init_db() -> None:
                 )
 
         if should_force_text_update:
-            await conn.execute(
-                text(
-                    "UPDATE bot_texts "
-                    "SET text = replace(text, 'Telegram Stars', 'Робокассу'), "
-                    "updated_at = :updated_at "
-                    "WHERE text LIKE '%Telegram Stars%'"
-                ),
-                {"updated_at": now},
-            )
-            result = await conn.execute(
-                text(
-                    "UPDATE bot_texts "
-                    "SET text = replace(text, ' Stars', ' ₽'), "
-                    "updated_at = :updated_at "
-                    "WHERE text LIKE '% Stars%'"
-                ),
-                {"updated_at": now},
-            )
-            logger.info(
-                "Bot text Stars-to-rub cleanup: rows=%s",
-                result.rowcount,
-            )
-            result = await conn.execute(
-                text(
-                    "UPDATE bot_texts "
-                    "SET text = replace(text, 'Stars', '₽'), "
-                    "updated_at = :updated_at "
-                    "WHERE text LIKE '%Stars%'"
-                ),
-                {"updated_at": now},
-            )
-            logger.info(
-                "Bot text remaining Stars cleanup: rows=%s",
-                result.rowcount,
-            )
-
-            main_menu_title, main_menu_text = DEFAULT_BOT_TEXTS["main_menu"]
-            result = await conn.execute(
-                text(
-                    "UPDATE bot_texts "
-                    "SET title = :title, text = :new_text, updated_at = :updated_at "
-                    "WHERE key = :key"
-                ),
-                {
-                    "key": "start_message",
-                    "title": main_menu_title,
-                    "new_text": main_menu_text,
-                    "updated_at": now,
-                },
-            )
-            logger.info(
-                "Bot text forced update alias: key=start_message rows=%s",
-                result.rowcount,
-            )
+            await force_rub_payment_ui_texts(conn)
 
             await conn.execute(
                 text(

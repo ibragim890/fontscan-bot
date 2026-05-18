@@ -1,7 +1,5 @@
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from app.config import settings
-
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -85,24 +83,20 @@ def subscription_menu_keyboard(
     if user_has_active_paid_plan:
         return back_to_menu_keyboard()
 
-    rows = []
-    if settings.robokassa_enabled:
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text="Оплатить Designer картой",
-                    callback_data="pay_card:designer",
-                )
-            ]
-        )
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text="Оплатить Studio картой",
-                    callback_data="pay_card:studio",
-                )
-            ]
-        )
+    rows = [
+        [
+            InlineKeyboardButton(
+                text="Оплатить Designer картой",
+                callback_data="pay_card:designer",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="Оплатить Studio картой",
+                callback_data="pay_card:studio",
+            )
+        ],
+    ]
     rows.append(
         [
             InlineKeyboardButton(
