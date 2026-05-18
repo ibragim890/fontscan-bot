@@ -20,16 +20,16 @@ from app.keyboards import (
     subscription_menu_keyboard,
 )
 from app.payments import (
-    TARIFFS,
     create_payment_intent,
     get_tariff,
+    list_tariffs,
     save_successful_payment,
     send_subscription_invoice,
     validate_pre_checkout,
 )
 from app.config import settings
 from app.models import Payment, PaymentIntent
-from app.texts import NO_ACTIVE_SUBSCRIPTION_TEXT
+from app.texts import NO_ACTIVE_SUBSCRIPTION_TEXT, get_bot_text
 
 logger = logging.getLogger(__name__)
 router = Router(name="payments")
@@ -39,7 +39,7 @@ router = Router(name="payments")
 async def subscribe_handler(message: Message, session: AsyncSession) -> None:
     user = await get_or_create_user(session, message.from_user)
     await message.answer(
-        get_subscription_text(user),
+        await get_subscription_text(session, user),
         reply_markup=subscription_menu_keyboard(
             user_has_current_paid_subscription(user)
         ),
@@ -57,12 +57,12 @@ async def subscribe_callback(callback: CallbackQuery, session: AsyncSession) -> 
         return
 
     tariff = callback.data.split(":", maxsplit=1)[1]
-    plan = get_tariff(tariff)
+    plan = await get_tariff(session, tariff)
     if plan is None:
         await callback.answer("Тариф не найден.", show_alert=True)
         return
 
-    intent = await create_payment_intent(session, callback.from_user.id, plan.key)
+    intent = await create_payment_intent(session, callback.from_user.id, plan.code)
     await session.commit()
 
     try:
@@ -70,6 +70,7 @@ async def subscribe_callback(callback: CallbackQuery, session: AsyncSession) -> 
             callback.bot,
             callback.from_user.id,
             intent,
+            plan,
         )
         if delivery.invoice_link:
             await callback.message.answer(
@@ -82,7 +83,7 @@ async def subscribe_callback(callback: CallbackQuery, session: AsyncSession) -> 
         await session.commit()
         logger.exception(
             "Failed to create Stars invoice: tariff=%s amount=%s payload=%s error=%s",
-            plan.key,
+            plan.code,
             plan.price_stars,
             intent.payload,
             str(exc),
@@ -129,7 +130,7 @@ async def successful_payment_handler(message: Message, session: AsyncSession) ->
             user,
             message.successful_payment,
         )
-        plan = get_tariff(intent.tariff)
+        plan = await get_tariff(session, intent.tariff, active_only=False)
         if plan is None:
             raise ValueError("Unknown tariff")
         logger.info(
@@ -140,11 +141,13 @@ async def successful_payment_handler(message: Message, session: AsyncSession) ->
             payment.telegram_payment_charge_id,
         )
         await message.answer(
-            "Подписка активирована ✅\n\n"
-            f"Тариф: {plan.title}\n"
-            f"Распознаваний: {plan.monthly_limit}\n"
-            f"Доступ до: {format_date(user.plan_ends_at)}\n\n"
-            "Теперь отправьте фото со шрифтом.",
+            await get_bot_text(
+                session,
+                f"payment_success_{plan.code}",
+                tariff=plan.title,
+                limit=plan.monthly_limit,
+                date=format_date(user.plan_ends_at),
+            ),
             reply_markup=main_menu_keyboard(),
         )
     except Exception as exc:
@@ -226,6 +229,7 @@ async def debug_payments_handler(message: Message, session: AsyncSession) -> Non
     )
     intents = intents_result.scalars().all()
     payments = payments_result.scalars().all()
+    tariffs = await list_tariffs(session)
 
     intent_lines = [
         (
@@ -251,7 +255,13 @@ async def debug_payments_handler(message: Message, session: AsyncSession) -> Non
 
     await message.answer(
         f"aiogram version: {aiogram.__version__}\n\n"
-        f"tariffs: {TARIFFS}\n\n"
+        "tariffs:\n"
+        + "\n".join(
+            f"{tariff.code}: {tariff.price_stars} Stars, "
+            f"{tariff.monthly_limit} распознаваний"
+            for tariff in tariffs
+        )
+        + "\n\n"
         "Последние PaymentIntent:\n"
         f"{chr(10).join(intent_lines) if intent_lines else 'нет'}\n\n"
         "Последние Payment:\n"

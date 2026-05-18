@@ -12,35 +12,24 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.models import Payment, PaymentIntent, User
+from app.models import Payment, PaymentIntent, Tariff as TariffModel, User
 
 logger = logging.getLogger(__name__)
 SUBSCRIPTION_PERIOD_SECONDS = settings.subscription_period
 STARS_CURRENCY = "XTR"
 
-TARIFFS = {
-    "designer": {
-        "title": "Designer",
-        "price_stars": settings.designer_price_stars,
-        "monthly_limit": settings.designer_monthly_limit,
-        "description": f"{settings.designer_monthly_limit} распознаваний шрифтов в месяц",
-    },
-    "studio": {
-        "title": "Studio",
-        "price_stars": settings.studio_price_stars,
-        "monthly_limit": settings.studio_monthly_limit,
-        "description": f"{settings.studio_monthly_limit} распознаваний шрифтов в месяц",
-    },
-}
-
 
 @dataclass(frozen=True)
-class Tariff:
-    key: str
+class TariffPlan:
+    code: str
     title: str
     price_stars: int
     monthly_limit: int
     description: str
+
+    @property
+    def key(self) -> str:
+        return self.code
 
 
 @dataclass(frozen=True)
@@ -88,16 +77,45 @@ def ensure_send_invoice_subscription_period_support() -> None:
     Bot.send_invoice = send_invoice_with_subscription_period
 
 
-def get_tariff(tariff: str) -> Tariff | None:
+def tariff_from_model(tariff: TariffModel) -> TariffPlan:
+    return TariffPlan(
+        code=tariff.code,
+        title=tariff.title,
+        price_stars=tariff.price_stars,
+        monthly_limit=tariff.monthly_limit,
+        description=f"{tariff.monthly_limit} распознаваний шрифтов в месяц",
+    )
+
+
+async def get_tariff(
+    session: AsyncSession,
+    tariff: str,
+    *,
+    active_only: bool = True,
+) -> TariffPlan | None:
     normalized = tariff.lower().strip()
-    tariff_config = TARIFFS.get(normalized)
-    if tariff_config is not None:
-        return Tariff(key=normalized, **tariff_config)
-    return None
+    query = select(TariffModel).where(TariffModel.code == normalized)
+    if active_only:
+        query = query.where(TariffModel.is_active.is_(True))
+    result = await session.execute(query)
+    tariff_model = result.scalar_one_or_none()
+    return tariff_from_model(tariff_model) if tariff_model is not None else None
 
 
-def tariff_title(tariff: str) -> str:
-    plan = get_tariff(tariff)
+async def list_tariffs(
+    session: AsyncSession,
+    *,
+    active_only: bool = False,
+) -> list[TariffPlan]:
+    query = select(TariffModel).order_by(TariffModel.id)
+    if active_only:
+        query = query.where(TariffModel.is_active.is_(True))
+    result = await session.execute(query)
+    return [tariff_from_model(tariff) for tariff in result.scalars().all()]
+
+
+async def tariff_title(session: AsyncSession, tariff: str) -> str:
+    plan = await get_tariff(session, tariff, active_only=False)
     return plan.title if plan else tariff
 
 
@@ -106,13 +124,9 @@ def provider_token_error(exc: Exception) -> bool:
     return "provider_token" in message or "provider token" in message
 
 
-def build_invoice_payload(tariff_key: str, payload: str) -> dict[str, Any]:
-    if tariff_key not in TARIFFS:
-        raise ValueError("Unknown tariff")
-
-    tariff = TARIFFS[tariff_key]
-    title = f"{tariff['title']} подписка"
-    description = tariff["description"]
+def build_invoice_payload(plan: TariffPlan, payload: str) -> dict[str, Any]:
+    title = f"{plan.title} подписка"
+    description = plan.description
 
     if not 1 <= len(payload.encode("utf-8")) <= 128:
         raise ValueError("Invoice payload must be 1-128 bytes")
@@ -123,8 +137,8 @@ def build_invoice_payload(tariff_key: str, payload: str) -> dict[str, Any]:
 
     prices = [
         LabeledPrice(
-            label=f"{tariff['title']} на 30 дней",
-            amount=tariff["price_stars"],
+            label=f"{plan.title} на 30 дней",
+            amount=plan.price_stars,
         )
     ]
 
@@ -156,14 +170,14 @@ async def create_payment_intent(
     telegram_id: int,
     tariff: str,
 ) -> PaymentIntent:
-    plan = get_tariff(tariff)
+    plan = await get_tariff(session, tariff)
     if plan is None:
         raise ValueError("Unknown tariff")
 
     intent = PaymentIntent(
-        payload=f"sub:{plan.key}:{telegram_id}:{uuid4()}",
+        payload=f"sub:{plan.code}:{telegram_id}:{uuid4()}",
         telegram_id=telegram_id,
-        tariff=plan.key,
+        tariff=plan.code,
         amount_stars=plan.price_stars,
         status="pending",
     )
@@ -177,11 +191,12 @@ async def create_payment_intent(
 async def create_subscription_invoice_link(
     bot: Bot,
     payment_intent: PaymentIntent,
+    plan: TariffPlan,
     *,
     omit_provider_token: bool = False,
 ) -> str:
     invoice_payload = build_invoice_payload(
-        payment_intent.tariff,
+        plan,
         payment_intent.payload,
     )
     if omit_provider_token:
@@ -194,11 +209,12 @@ async def send_subscription_invoice(
     bot: Bot,
     chat_id: int,
     payment_intent: PaymentIntent,
+    plan: TariffPlan,
 ) -> InvoiceDeliveryResult:
     ensure_send_invoice_subscription_period_support()
 
     invoice_payload = build_invoice_payload(
-        payment_intent.tariff,
+        plan,
         payment_intent.payload,
     )
 
@@ -233,6 +249,7 @@ async def send_subscription_invoice(
             invoice_link = await create_subscription_invoice_link(
                 bot,
                 payment_intent,
+                plan,
                 omit_provider_token=False,
             )
             return InvoiceDeliveryResult(
@@ -252,6 +269,7 @@ async def send_subscription_invoice(
                     invoice_link = await create_subscription_invoice_link(
                         bot,
                         payment_intent,
+                        plan,
                         omit_provider_token=True,
                     )
                     return InvoiceDeliveryResult(
@@ -289,7 +307,7 @@ async def validate_pre_checkout(
     if intent is None:
         return False, "Платёж не найден. Создайте счёт заново через /subscribe.", None
 
-    plan = get_tariff(intent.tariff)
+    plan = await get_tariff(session, intent.tariff)
     if plan is None:
         intent.status = "rejected"
         return False, "Тариф не найден. Создайте счёт заново через /subscribe.", intent
@@ -306,10 +324,6 @@ async def validate_pre_checkout(
         return False, "Неверная валюта платежа.", intent
 
     if query.total_amount != intent.amount_stars:
-        intent.status = "rejected"
-        return False, "Неверная сумма платежа.", intent
-
-    if intent.amount_stars != plan.price_stars:
         intent.status = "rejected"
         return False, "Неверная сумма платежа.", intent
 
@@ -351,7 +365,7 @@ async def save_successful_payment(
     if intent is None:
         raise ValueError("Payment intent not found")
 
-    plan = get_tariff(intent.tariff)
+    plan = await get_tariff(session, intent.tariff, active_only=False)
     if plan is None:
         raise ValueError("Unknown tariff")
 
@@ -365,7 +379,12 @@ async def save_successful_payment(
     )
     if existing is not None:
         intent.status = "paid"
-        activate_plan(user, intent.tariff, existing.subscription_expiration_date)
+        activate_plan(
+            user,
+            intent.tariff,
+            plan.monthly_limit,
+            existing.subscription_expiration_date,
+        )
         user.subscription_payment_charge_id = existing.telegram_payment_charge_id
         user.subscription_payload = existing.invoice_payload
         return existing, intent
@@ -388,7 +407,12 @@ async def save_successful_payment(
     )
     session.add(payment)
     intent.status = "paid"
-    activate_plan(user, intent.tariff, payment.subscription_expiration_date)
+    activate_plan(
+        user,
+        intent.tariff,
+        plan.monthly_limit,
+        payment.subscription_expiration_date,
+    )
     user.subscription_payment_charge_id = payment.telegram_payment_charge_id
     user.subscription_payload = payment.invoice_payload
     await session.flush()

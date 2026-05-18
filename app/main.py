@@ -34,11 +34,11 @@ async def run() -> None:
     dp.callback_query.middleware(db_middleware)
     dp.pre_checkout_query.middleware(db_middleware)
 
+    dp.include_router(admin.router)
     dp.include_router(start.router)
     dp.include_router(status.router)
     dp.include_router(support.router)
     dp.include_router(payments.router)
-    dp.include_router(admin.router)
     dp.include_router(photo.router)
 
     try:

@@ -1,48 +1,16 @@
+from collections.abc import Mapping
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.config import settings
-
-START_TEXT = """Я помогу найти шрифт по фото.
-
-Отправьте фото или скрин с текстом.
-Лучше присылать крупный фрагмент одного слова.
-
-Пробный доступ: 2 дня и 3 распознавания.
-После пробного доступа нужна подписка.
-
-Бот может допускать неточное определение шрифта."""
-
-MAIN_MENU_TEXT = """Меню
-
-Я помогу найти шрифт по фото.
-
-Отправьте фото или скрин с текстом.
-Лучше присылать крупный фрагмент одного слова.
-
-Пробный доступ: 2 дня и 3 распознавания.
-
-Выберите действие:"""
+from app.models import BotText
 
 PROCESSING_TEXT = "Ищу шрифт..."
-
-NO_ACCESS_TEXT = """Пробный доступ закончился или лимит распознаваний исчерпан.
-
-Оформите подписку, чтобы продолжить пользоваться ботом.
-
-Designer — 99 Stars / 20 распознаваний
-Studio — 199 Stars / 50 распознаваний"""
-
 NOT_PHOTO_TEXT = "Отправьте фото или скрин с текстом."
-
 DOWNLOAD_ERROR_TEXT = "Не удалось скачать фото. Попробуйте ещё раз."
-
 TEMP_OVERLOADED_TEXT = "Сервис временно перегружен. Попробуйте позже."
-
 TEMP_UNAVAILABLE_TEXT = "Сервис временно недоступен. Попробуйте позже."
-
-FIND_FONT_TEXT = """Отправьте фото или скрин с текстом.
-
-Лучше присылать крупный фрагмент одного слова.
-Не отправляйте всю карточку целиком, если нужен конкретный шрифт."""
-
 NO_ACTIVE_SUBSCRIPTION_TEXT = "У вас нет активной подписки."
 
 PAYMENT_SUPPORT_TEXT = """По вопросам оплаты напишите в поддержку: {support}
@@ -53,30 +21,239 @@ PAYMENT_SUPPORT_TEXT = """По вопросам оплаты напишите в
 3. Дату оплаты
 4. Описание проблемы"""
 
-TERMS_TEXT = """1. Бот автоматически определяет шрифт по фото через внешний сервис.
+DEFAULT_BOT_TEXTS: dict[str, tuple[str, str]] = {
+    "main_menu": (
+        "Главное меню",
+        """Меню
+
+Я помогу найти шрифт по фото.
+
+Отправьте фото или скрин с текстом.
+Лучше присылать крупный фрагмент одного слова.
+
+Пробный доступ: {trial_days} дня и {trial_limit} распознавания.
+
+Выберите действие:""",
+    ),
+    "find_font": (
+        "Узнать шрифт",
+        """Отправьте фото или скрин с текстом.
+
+Лучше присылать крупный фрагмент одного слова.
+Не отправляйте всю карточку целиком, если нужен конкретный шрифт.""",
+    ),
+    "subscription_trial": (
+        "Подписка: Trial",
+        """Подписка
+
+Статус: Trial
+Осталось: {days_left} д. {hours_left} ч.
+Распознаваний осталось: {remaining} / {limit}
+
+После пробного доступа нужна подписка.
+
+Designer — {price_designer} Stars / месяц, {limit_designer} распознаваний.
+Studio — {price_studio} Stars / месяц, {limit_studio} распознаваний.""",
+    ),
+    "subscription_no_access": (
+        "Подписка: нет доступа",
+        """Подписка
+
+Статус: Нет активного доступа
+
+Designer — {price_designer} Stars / месяц, {limit_designer} распознаваний.
+Studio — {price_studio} Stars / месяц, {limit_studio} распознаваний.""",
+    ),
+    "subscription_designer": (
+        "Подписка: Designer",
+        """Подписка
+
+Статус: Designer ✅
+Доступ до: {date}
+Распознаваний осталось: {remaining} / {limit}""",
+    ),
+    "subscription_studio": (
+        "Подписка: Studio",
+        """Подписка
+
+Статус: Studio ✅
+Доступ до: {date}
+Распознаваний осталось: {remaining} / {limit}""",
+    ),
+    "profile_trial": (
+        "Профиль: Trial",
+        """Профиль
+
+Статус: Trial
+Осталось: {days_left} д. {hours_left} ч.
+Распознаваний осталось: {remaining} / {limit}""",
+    ),
+    "profile_no_access": (
+        "Профиль: нет доступа",
+        """Профиль
+
+Статус: Нет активной подписки
+
+Оформите подписку, чтобы продолжить.""",
+    ),
+    "profile_designer": (
+        "Профиль: Designer",
+        """Профиль
+
+Статус: Designer ✅
+Подписка активна до: {date}
+Осталось дней: {days_left}
+Распознаваний осталось: {remaining} / {limit}""",
+    ),
+    "profile_studio": (
+        "Профиль: Studio",
+        """Профиль
+
+Статус: Studio ✅
+Подписка активна до: {date}
+Осталось дней: {days_left}
+Распознаваний осталось: {remaining} / {limit}""",
+    ),
+    "no_access": (
+        "Нет доступа",
+        """Пробный доступ закончился или лимит распознаваний исчерпан.
+
+Оформите подписку, чтобы продолжить пользоваться ботом.
+
+Designer — {price_designer} Stars / {limit_designer} распознаваний
+Studio — {price_studio} Stars / {limit_studio} распознаваний""",
+    ),
+    "font_result_found": (
+        "Результат: найден",
+        """Шрифт: {font_title}
+
+Бот может допускать неточное определение шрифта.""",
+    ),
+    "font_result_not_found": (
+        "Результат: не найден",
+        """Шрифт: не определён
+
+Бот может допускать неточное определение шрифта.""",
+    ),
+    "payment_success_designer": (
+        "Оплата: Designer",
+        """Подписка активирована ✅
+
+Тариф: Designer
+Распознаваний: {limit}
+Доступ до: {date}
+
+Теперь отправьте фото со шрифтом.""",
+    ),
+    "payment_success_studio": (
+        "Оплата: Studio",
+        """Подписка активирована ✅
+
+Тариф: Studio
+Распознаваний: {limit}
+Доступ до: {date}
+
+Теперь отправьте фото со шрифтом.""",
+    ),
+    "support": (
+        "Поддержка",
+        "Поддержка: {support_username}",
+    ),
+    "terms": (
+        "Условия",
+        """1. Бот автоматически определяет шрифт по фото.
 2. Результат может быть неточным.
-3. После окончания пробного доступа требуется платная подписка.
-4. Оплата производится через Telegram Stars.
-5. Возврат и вопросы по оплате обрабатываются через /paysupport."""
+3. После пробного доступа нужна подписка.
+4. Оплата производится через Telegram Stars.""",
+    ),
+}
 
 
-def font_result_text(title: str | None) -> str:
-    font_name = title.strip() if title and title.strip() else "не определён"
-    return (
-        f"Шрифт: {font_name}\n\n"
-        "Бот может допускать неточное определение шрифта."
+class SafeFormatDict(dict[str, object]):
+    def __missing__(self, key: str) -> str:
+        return "{" + key + "}"
+
+
+def render_template(template: str, values: Mapping[str, object]) -> str:
+    try:
+        return template.format_map(SafeFormatDict(values))
+    except Exception:
+        return template
+
+
+def default_text_title(key: str) -> str:
+    return DEFAULT_BOT_TEXTS.get(key, (key, ""))[0]
+
+
+def default_text_value(key: str) -> str:
+    return DEFAULT_BOT_TEXTS.get(key, (key, ""))[1]
+
+
+async def get_bot_text_template(session: AsyncSession, key: str) -> str:
+    result = await session.execute(select(BotText).where(BotText.key == key))
+    bot_text = result.scalar_one_or_none()
+    if bot_text is not None:
+        return bot_text.text
+    return default_text_value(key)
+
+
+async def get_bot_text(session: AsyncSession, key: str, **kwargs: object) -> str:
+    template = await get_bot_text_template(session, key)
+    return render_template(template, kwargs)
+
+
+async def set_bot_text(session: AsyncSession, key: str, text: str) -> BotText:
+    result = await session.execute(select(BotText).where(BotText.key == key))
+    bot_text = result.scalar_one_or_none()
+    if bot_text is None:
+        bot_text = BotText(
+            key=key,
+            title=default_text_title(key),
+            text=text,
+        )
+        session.add(bot_text)
+        await session.flush()
+        return bot_text
+
+    bot_text.text = text
+    return bot_text
+
+
+async def list_bot_texts(session: AsyncSession) -> list[BotText]:
+    result = await session.execute(select(BotText).order_by(BotText.id))
+    texts_by_key = {bot_text.key: bot_text for bot_text in result.scalars().all()}
+    texts = []
+    for key, (title, text) in DEFAULT_BOT_TEXTS.items():
+        texts.append(texts_by_key.get(key) or BotText(key=key, title=title, text=text))
+    return texts
+
+
+async def reset_bot_text(session: AsyncSession, key: str) -> BotText:
+    return await set_bot_text(session, key, default_text_value(key))
+
+
+async def font_result_text(session: AsyncSession, title: str | None) -> str:
+    font_name = title.strip() if title and title.strip() else ""
+    if font_name:
+        return await get_bot_text(
+            session,
+            "font_result_found",
+            font_title=font_name,
+        )
+    return await get_bot_text(session, "font_result_not_found")
+
+
+async def support_text(session: AsyncSession) -> str:
+    return await get_bot_text(
+        session,
+        "support",
+        support_username=settings.support_contact,
     )
-
-
-def support_text() -> str:
-    return f"Поддержка: {settings.support_contact}"
 
 
 def paysupport_text() -> str:
     return PAYMENT_SUPPORT_TEXT.format(support=settings.support_contact)
 
 
-def terms_text() -> str:
-    if settings.terms_url.strip():
-        return f"Условия: {settings.terms_url.strip()}"
-    return TERMS_TEXT
+async def terms_text(session: AsyncSession) -> str:
+    return await get_bot_text(session, "terms")

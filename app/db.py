@@ -1,4 +1,5 @@
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
 from typing import Any
 
 from aiogram import BaseMiddleware
@@ -35,6 +36,80 @@ async def init_db() -> None:
                     "ALTER TABLE font_requests "
                     "ADD COLUMN is_cached_response BOOLEAN DEFAULT 0 NOT NULL"
                 )
+            )
+
+        now = datetime.now(timezone.utc)
+        default_tariffs = [
+            (
+                "designer",
+                "Designer",
+                settings.designer_price_stars,
+                settings.designer_monthly_limit,
+            ),
+            (
+                "studio",
+                "Studio",
+                settings.studio_price_stars,
+                settings.studio_monthly_limit,
+            ),
+        ]
+        for code, title, price_stars, monthly_limit in default_tariffs:
+            await conn.execute(
+                text(
+                    "INSERT INTO tariffs "
+                    "(code, title, price_stars, monthly_limit, is_active, "
+                    "created_at, updated_at) "
+                    "SELECT :code, :title, :price_stars, :monthly_limit, 1, "
+                    ":created_at, :updated_at "
+                    "WHERE NOT EXISTS ("
+                    "SELECT 1 FROM tariffs WHERE code = :code"
+                    ")"
+                ),
+                {
+                    "code": code,
+                    "title": title,
+                    "price_stars": price_stars,
+                    "monthly_limit": monthly_limit,
+                    "created_at": now,
+                    "updated_at": now,
+                },
+            )
+
+        default_settings = [
+            ("trial_days", str(settings.trial_days)),
+            ("trial_requests_limit", str(settings.trial_requests_limit)),
+        ]
+        for key, value in default_settings:
+            await conn.execute(
+                text(
+                    "INSERT INTO app_settings (key, value, updated_at) "
+                    "SELECT :key, :value, :updated_at "
+                    "WHERE NOT EXISTS ("
+                    "SELECT 1 FROM app_settings WHERE key = :key"
+                    ")"
+                ),
+                {"key": key, "value": value, "updated_at": now},
+            )
+
+        from app.texts import DEFAULT_BOT_TEXTS
+
+        for key, (title, text_value) in DEFAULT_BOT_TEXTS.items():
+            await conn.execute(
+                text(
+                    "INSERT INTO bot_texts "
+                    "(key, title, text, created_at, updated_at) "
+                    "SELECT :key, :title, :text, :created_at, :updated_at "
+                    "WHERE NOT EXISTS ("
+                    "SELECT 1 FROM bot_texts WHERE key = :key"
+                    ")"
+                ),
+                {
+                    "key": key,
+                    "title": title,
+                    "text": text_value,
+                    "created_at": now,
+                    "updated_at": now,
+                },
             )
 
 

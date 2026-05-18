@@ -148,3 +148,92 @@ def admin_keyboard() -> InlineKeyboardMarkup:
             ]
         ]
     )
+
+
+def text_menu_keyboard(
+    categories: list[tuple[str, str]],
+) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=title,
+                callback_data=f"textcat:{code}",
+            )
+        ]
+        for code, title in categories
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def text_category_keyboard(
+    items: list[tuple[str, str]],
+    category: str,
+) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=title,
+                callback_data=f"textedit:{key}",
+            )
+        ]
+        for key, title in items
+    ]
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="⬅️ Назад",
+                callback_data="textmenu:main",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def text_edit_keyboard(key: str, category: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Изменить",
+                    callback_data=f"text_change:{key}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Сбросить",
+                    callback_data=f"text_reset:{key}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data=f"text_back:{category}",
+                )
+            ],
+        ]
+    )
+
+
+def text_after_save_keyboard(key: str, category: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Вернуться к блоку",
+                    callback_data=f"textedit:{key}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="В меню текстов",
+                    callback_data="textmenu:main",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data=f"text_back:{category}",
+                )
+            ],
+        ]
+    )

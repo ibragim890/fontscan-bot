@@ -9,7 +9,9 @@ from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.access import (
+    get_no_access_text,
     get_or_create_user,
+    get_trial_config,
     increment_usage,
     now_utc,
     start_trial_if_needed,
@@ -21,7 +23,6 @@ from app.keyboards import no_access_subscription_keyboard, result_actions_keyboa
 from app.models import ApiKeyUsage, FontRequest
 from app.texts import (
     DOWNLOAD_ERROR_TEXT,
-    NO_ACCESS_TEXT,
     NOT_PHOTO_TEXT,
     PROCESSING_TEXT,
     TEMP_UNAVAILABLE_TEXT,
@@ -34,12 +35,16 @@ router = Router(name="photo")
 
 @router.message(F.photo)
 async def photo_handler(message: Message, session: AsyncSession) -> None:
-    user = await get_or_create_user(session, message.from_user)
-    start_trial_if_needed(user)
+    if message.caption and message.caption.lstrip().startswith("/"):
+        return
 
-    if not user_can_make_request(user):
+    user = await get_or_create_user(session, message.from_user)
+    trial_config = await get_trial_config(session)
+    start_trial_if_needed(user, trial_config.days)
+
+    if not user_can_make_request(user, trial_config.requests_limit):
         await message.answer(
-            NO_ACCESS_TEXT,
+            await get_no_access_text(session),
             reply_markup=no_access_subscription_keyboard(),
         )
         return
@@ -72,7 +77,7 @@ async def photo_handler(message: Message, session: AsyncSession) -> None:
         )
         await safe_edit_text(
             processing_message,
-            font_result_text(cached_request.top_font),
+            await font_result_text(session, cached_request.top_font),
             reply_markup=result_actions_keyboard(),
         )
         return
@@ -100,7 +105,7 @@ async def photo_handler(message: Message, session: AsyncSession) -> None:
         )
 
     if result.counted_as_usage:
-        increment_usage(user)
+        increment_usage(user, trial_config.requests_limit)
 
     font_request = FontRequest(
         telegram_id=message.from_user.id,
@@ -123,7 +128,7 @@ async def photo_handler(message: Message, session: AsyncSession) -> None:
 
     await safe_edit_text(
         processing_message,
-        font_result_text(result.title),
+        await font_result_text(session, result.title),
         reply_markup=result_actions_keyboard(),
     )
 
@@ -215,6 +220,9 @@ async def download_largest_photo(message: Message) -> bytes | None:
     return buffer.getvalue()
 
 
-@router.message()
+@router.message(F.text)
 async def non_photo_handler(message: Message) -> None:
+    if message.text and message.text.lstrip().startswith("/"):
+        return
+
     await message.answer(NOT_PHOTO_TEXT)
