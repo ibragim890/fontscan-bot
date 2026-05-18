@@ -250,12 +250,57 @@ async def get_main_menu_text(session: AsyncSession) -> str:
 
 
 async def get_no_access_text(session: AsyncSession) -> str:
-    text = await get_bot_text(
+    base_text = await get_bot_text(
         session,
         "no_access",
         **(await get_tariff_text_values(session)),
     )
+    text = append_rub_tariff_block(
+        strip_payment_tariff_lines(base_text),
+        await get_tariff_text_values(session),
+        include_month=False,
+    )
     return with_card_payment_unavailable_notice(text)
+
+
+def strip_payment_tariff_lines(text: str) -> str:
+    blocked_parts = ("Designer", "Studio", "Выберите тариф", "St" + "ars")
+    lines = [
+        line.rstrip()
+        for line in text.splitlines()
+        if not any(part in line for part in blocked_parts)
+    ]
+    return "\n".join(lines).strip()
+
+
+def rub_tariff_block(values: dict[str, object], *, include_month: bool = True) -> str:
+    if not include_month:
+        return (
+            f"Designer — {values['price_designer']} ₽ / "
+            f"{values['limit_designer']} распознаваний\n"
+            f"Studio — {values['price_studio']} ₽ / "
+            f"{values['limit_studio']} распознаваний"
+        )
+    period = " / месяц"
+    return (
+        f"Designer — {values['price_designer']} ₽{period}, "
+        f"{values['limit_designer']} распознаваний.\n"
+        f"Studio — {values['price_studio']} ₽{period}, "
+        f"{values['limit_studio']} распознаваний."
+    )
+
+
+def append_rub_tariff_block(
+    text: str,
+    values: dict[str, object],
+    *,
+    include_month: bool = True,
+    include_choose: bool = False,
+) -> str:
+    parts = [text, rub_tariff_block(values, include_month=include_month)]
+    if include_choose:
+        parts.append("Выберите тариф:")
+    return "\n\n".join(part for part in parts if part)
 
 
 def with_card_payment_unavailable_notice(text: str) -> str:
@@ -333,7 +378,8 @@ async def get_subscription_text(session: AsyncSession, user: User) -> str:
 
     if user_has_active_trial(user, trial_config.requests_limit):
         days_left, hours_left = duration_parts_until(user.trial_ends_at)
-        text = await get_bot_text(
+        tariff_values = await get_tariff_text_values(session)
+        base_text = await get_bot_text(
             session,
             "subscription_trial",
             status="Trial",
@@ -344,15 +390,27 @@ async def get_subscription_text(session: AsyncSession, user: User) -> str:
                 trial_config.requests_limit,
             ),
             limit=trial_config.requests_limit,
-            **(await get_tariff_text_values(session)),
+            **tariff_values,
+        )
+        text = append_rub_tariff_block(
+            strip_payment_tariff_lines(base_text),
+            tariff_values,
+            include_month=True,
         )
         return with_card_payment_unavailable_notice(text)
 
-    text = await get_bot_text(
+    tariff_values = await get_tariff_text_values(session)
+    base_text = await get_bot_text(
         session,
         "subscription_no_access",
         status="Нет активного доступа",
-        **(await get_tariff_text_values(session)),
+        **tariff_values,
+    )
+    text = append_rub_tariff_block(
+        strip_payment_tariff_lines(base_text),
+        tariff_values,
+        include_month=True,
+        include_choose=True,
     )
     return with_card_payment_unavailable_notice(text)
 

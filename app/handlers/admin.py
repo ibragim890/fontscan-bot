@@ -10,10 +10,11 @@ from aiogram.types import CallbackQuery, FSInputFile, Message
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.access import get_trial_config, now_utc, set_app_setting
+from app.access import get_tariff_text_values, get_trial_config, now_utc, set_app_setting
 from app.config import settings
 from app.db import force_rub_payment_ui_texts
 from app.keyboards import (
+    subscription_menu_keyboard,
     text_after_save_keyboard,
     text_category_keyboard,
     text_edit_keyboard,
@@ -30,6 +31,7 @@ from app.models import (
 from app.payments import list_tariffs
 from app.texts import (
     DEFAULT_BOT_TEXTS,
+    get_bot_text,
     get_bot_text_template,
     list_bot_texts,
     reset_bot_text,
@@ -994,6 +996,39 @@ async def force_rub_ui_handler(message: Message, session: AsyncSession) -> None:
 
     await force_rub_payment_ui_texts(session)
     await message.answer("Интерфейс оплаты обновлён на ₽ и карту.")
+
+
+@router.message(Command("debug_payment_ui"))
+async def debug_payment_ui_handler(message: Message, session: AsyncSession) -> None:
+    if not await require_tariff_admin(message, session):
+        return
+
+    keyboard = subscription_menu_keyboard(user_has_active_paid_plan=False)
+    button_lines = []
+    button_values = []
+    for row in keyboard.inline_keyboard:
+        for button in row:
+            callback_data = button.callback_data or ""
+            button_values.append(f"{button.text} {callback_data}")
+            button_lines.append(f"- {button.text} | {callback_data}")
+
+    subscription_text = await get_bot_text(
+        session,
+        "subscription_no_access",
+        status="Нет активного доступа",
+        **(await get_tariff_text_values(session)),
+    )
+    forbidden = "St" + "ars"
+    contains_legacy = forbidden in "\n".join(button_values + [subscription_text])
+    await message.answer(
+        "Payment UI Debug:\n"
+        "Buttons:\n"
+        + "\n".join(button_lines)
+        + "\n\n"
+        f"Contains Stars: {str(contains_legacy).lower()}\n\n"
+        "subscription_no_access:\n"
+        f"{subscription_text}"
+    )
 
 
 @router.message(Command("admin_stats"))

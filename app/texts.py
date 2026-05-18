@@ -210,6 +210,14 @@ def render_template(template: str, values: Mapping[str, object]) -> str:
         return template
 
 
+def sanitize_user_text(text: str) -> str:
+    return (
+        text.replace("Telegram Stars", "Робокассу")
+        .replace(" Stars", " ₽")
+        .replace("Stars", "₽")
+    )
+
+
 def default_text_title(key: str) -> str:
     return DEFAULT_BOT_TEXTS.get(key, (key, ""))[0]
 
@@ -236,7 +244,7 @@ async def get_bot_text_template(session: AsyncSession, key: str) -> str:
 
 async def get_bot_text(session: AsyncSession, key: str, **kwargs: object) -> str:
     template = await get_bot_text_template(session, key)
-    return render_template(template, kwargs)
+    return sanitize_user_text(render_template(template, kwargs))
 
 
 async def set_bot_text(session: AsyncSession, key: str, text: str) -> BotText:

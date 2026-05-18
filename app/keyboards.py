@@ -1,4 +1,17 @@
+import logging
+
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+
+logger = logging.getLogger(__name__)
+
+
+def ensure_no_legacy_payment_ui(keyboard: InlineKeyboardMarkup) -> InlineKeyboardMarkup:
+    forbidden = "St" + "ars"
+    if forbidden in str(keyboard):
+        logger.error("Legacy payment label leaked into keyboard: %s", keyboard)
+    assert forbidden not in str(keyboard)
+    return keyboard
 
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
@@ -83,29 +96,30 @@ def subscription_menu_keyboard(
     if user_has_active_paid_plan:
         return back_to_menu_keyboard()
 
-    rows = [
-        [
-            InlineKeyboardButton(
-                text="Оплатить Designer картой",
-                callback_data="pay_card:designer",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text="Оплатить Studio картой",
-                callback_data="pay_card:studio",
-            )
-        ],
-    ]
-    rows.append(
-        [
-            InlineKeyboardButton(
-                text="⬅️ Назад",
-                callback_data="menu:main",
-            )
-        ]
+    return ensure_no_legacy_payment_ui(
+        InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Оплатить Designer картой",
+                        callback_data="pay_card:designer",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="Оплатить Studio картой",
+                        callback_data="pay_card:studio",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="⬅️ Назад",
+                        callback_data="menu:main",
+                    )
+                ],
+            ]
+        )
     )
-    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def cancel_subscription_keyboard() -> InlineKeyboardMarkup:
