@@ -1,0 +1,222 @@
+# Font Bot
+
+Telegram-бот на Python 3.11+ для определения шрифта по фото через WhatFontIs API. Запуск выполняется через long polling, без webhook.
+
+## Возможности
+
+- Пробный доступ не начинается после `/start`.
+- Пробный доступ начинается при первой отправке фото на распознавание.
+- Trial: 2 дня и 3 распознавания всего.
+- `/start` показывает одно главное меню с кнопками `🔎 Узнать шрифт` и `💳 Подписка`.
+- Главное меню работает через inline keyboard, без старого reply keyboard.
+- Кнопка `🔎 Узнать шрифт` просит отправить фото.
+- Кнопка `💳 Подписка` показывает статус, остаток распознаваний и оплату.
+- Подписки Telegram Stars:
+  - Designer: 99 Stars / месяц, 20 распознаваний.
+  - Studio: 199 Stars / месяц, 50 распознаваний.
+- Оплата запускается сразу при нажатии `Оплатить Designer` или `Оплатить Studio`.
+- После результата можно сразу нажать `🔎 Узнать другой шрифт` или открыть `💳 Подписка`.
+- Одинаковые картинки не вызывают WhatFontIs API повторно и не списывают лимит.
+- Фото пользователей не сохраняются на диск. В базе хранится только SHA-256 hash изображения и JSON-ответ сервиса.
+
+Для цифровых услуг внутри Telegram используется Telegram Stars.
+
+## Создание бота
+
+1. Откройте Telegram и найдите `@BotFather`.
+2. Выполните команду `/newbot`.
+3. Задайте имя и username бота.
+4. BotFather выдаст `BOT_TOKEN`. Сохраните его в `.env`.
+
+## WhatFontIs API
+
+1. Зарегистрируйтесь на WhatFontIs.
+2. Получите API-ключ в личном кабинете или у поддержки WhatFontIs.
+3. Укажите ключ в переменной `WHATFONTIS_API_KEYS`.
+
+Для коммерческого использования WhatFontIs API нужно согласовать commercial use с WhatFontIs.
+
+## Настройка
+
+Скопируйте пример окружения:
+
+```bash
+cp .env.example .env
+```
+
+Заполните `.env`:
+
+```env
+BOT_TOKEN=123456:telegram-token
+WHATFONTIS_API_KEYS=whatfontis-key
+DATABASE_URL=sqlite+aiosqlite:///bot.db
+ADMIN_IDS=123456789,987654321
+
+TRIAL_DAYS=2
+TRIAL_REQUESTS_LIMIT=3
+
+DESIGNER_PRICE_STARS=99
+DESIGNER_MONTHLY_LIMIT=20
+
+STUDIO_PRICE_STARS=199
+STUDIO_MONTHLY_LIMIT=50
+
+SUBSCRIPTION_PERIOD=2592000
+
+DAILY_API_SAFETY_LIMIT=90
+
+SUPPORT_USERNAME=@your_support
+TERMS_URL=https://example.com/terms
+```
+
+`ADMIN_IDS` можно оставить пустым или указать Telegram ID администраторов через запятую.
+
+## Установка
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+Для Windows PowerShell:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+## Запуск
+
+```bash
+python -m app.main
+```
+
+При первом запуске приложение создаст таблицы SQLite автоматически.
+
+## Railway Deploy
+
+1. Создайте GitHub repo.
+2. Залейте проект в репозиторий.
+3. В Railway выберите `New Project` → `Deploy from GitHub Repo`.
+4. В Railway → `Variables` добавьте:
+
+```env
+BOT_TOKEN=
+WHATFONTIS_API_KEYS=
+DATABASE_URL=
+ADMIN_IDS=
+SUPPORT_USERNAME=
+DAILY_API_SAFETY_LIMIT=90
+TRIAL_DAYS=2
+TRIAL_REQUESTS_LIMIT=3
+DESIGNER_PRICE_STARS=99
+DESIGNER_MONTHLY_LIMIT=20
+STUDIO_PRICE_STARS=199
+STUDIO_MONTHLY_LIMIT=50
+```
+
+Railway запускает long polling worker через `Procfile`:
+
+```text
+worker: python -m app.main
+```
+
+Если используется SQLite на Railway без volume, база может потеряться при redeploy. Для теста можно SQLite, для запуска лучше PostgreSQL.
+
+## Telegram Stars Payments
+
+Цифровые услуги внутри Telegram оплачиваются через Telegram Stars:
+
+- Валюта invoice: `XTR`.
+- `provider_token` пустой: `""`.
+- Для месячной подписки используется `subscription_period=2592000`.
+- В invoice передаётся один `LabeledPrice`.
+- Payload уникален и имеет формат `sub:<tariff>:<telegram_id>:<uuid>`.
+- После оплаты Telegram присылает `successful_payment`.
+- `telegram_payment_charge_id` сохраняется в базе и используется для отмены продления Stars-подписки.
+
+Тарифы:
+
+- Trial: 2 дня и 3 распознавания, бесплатно. Начинается только после первой отправки фото.
+- Designer: 99 Stars / месяц, 20 распознаваний.
+- Studio: 199 Stars / месяц, 50 распознаваний.
+
+## Кэш Изображений
+
+Бот считает `sha256` от скачанного изображения и сохраняет его как `image_hash`.
+
+Если пользователь повторно отправляет ту же картинку:
+
+- WhatFontIs API не вызывается.
+- Лимит trial или подписки не списывается.
+- Повторные картинки не тратят лимит распознаваний.
+- Пользователь получает тот же результат.
+- В базе сохраняется новая запись `FontRequest` с `provider="cache"` и `is_cached_response=True`.
+
+## WhatFontIs API Usage
+
+Бот ведёт дневной учёт запросов к WhatFontIs по каждому API key.
+
+- `WHATFONTIS_API_KEYS` может содержать один ключ или несколько ключей через запятую.
+- Сами API keys не показываются в интерфейсе.
+- Каждый реальный запрос к WhatFontIs увеличивает счётчик текущего ключа за сегодня.
+- Если WhatFontIs возвращает `429`, ключ помечается как `rate limited`.
+- `/admin_stats` показывает блок `WhatFontIs usage today` с количеством запросов по ключам.
+- `DAILY_API_SAFETY_LIMIT` ограничивает суммарное количество реальных WhatFontIs API calls за день по всем ключам.
+- Если `DAILY_API_SAFETY_LIMIT=0` или пустой, safety limit отключён.
+- Кэш проверяется до safety limit, поэтому повторные картинки продолжают отвечать без API и без списания лимита.
+
+## Если счёт не создаётся
+
+Проверьте:
+
+1. `BOT_TOKEN` правильный.
+2. Бот запущен в Telegram.
+3. `aiogram` обновлён: `pip install -U aiogram`.
+4. `provider_token=""`.
+5. `currency="XTR"`.
+6. `prices=[один LabeledPrice]`.
+7. `subscription_period=2592000`.
+8. Реальную ошибку в консоли после `logger.exception`.
+
+Для диагностики администратор из `ADMIN_IDS` может вызвать `/debug_payments`.
+
+## Проверка
+
+1. Отправьте `/start`: появится главное меню, trial ещё не должен начаться.
+2. Нажмите `🔎 Узнать шрифт`: бот попросит отправить фото.
+3. Отправьте фото или скрин с крупным фрагментом текста.
+4. Отправьте то же фото повторно: API не должен вызываться, лимит не должен списываться.
+5. Проверьте `/status`: должен появиться статус Trial.
+6. Используйте 3 уникальных распознавания и отправьте ещё одно фото: бот должен предложить подписку без вызова WhatFontIs.
+7. Отправьте `/subscribe` или нажмите `💳 Подписка`: бот покажет статус и тарифы.
+8. Нажмите `Оплатить Designer` или `Оплатить Studio`: invoice создаётся сразу.
+9. Проверьте `/status`: должен отобразиться тариф, дата окончания и остаток лимита.
+10. Проверьте `/cancel`: продление отменяется, доступ остаётся до даты окончания.
+11. Проверьте `/paysupport`, `/support`, `/terms`.
+
+## Команды
+
+- `/start` — приветствие.
+- `/status` — текущий доступ и лимиты.
+- `/subscribe` — выбор подписки.
+- `/cancel` — отмена продления активной Stars-подписки.
+- `/paysupport` — поддержка по оплате.
+- `/support` — общая поддержка.
+- `/terms` — условия.
+- `/admin_stats` — статистика для администраторов из `ADMIN_IDS`.
+- `/debug_payments` — диагностика платежей для администраторов из `ADMIN_IDS`.
+- `/reset_limits` — сбросить `trial_requests_used` и `monthly_requests_used` всем пользователям, только для `ADMIN_IDS`.
+- `/reset_trials` — сбросить trial всем пользователям без удаления paid-подписок, только для `ADMIN_IDS`.
+
+## Данные
+
+SQLite используется как MVP-хранилище. Бот не сохраняет исходные изображения пользователей. Для истории распознаваний сохраняются:
+
+- Telegram ID пользователя.
+- SHA-256 hash изображения.
+- Найденный шрифт.
+- JSON-ответ WhatFontIs.
+- Статус и флаг списания запроса.
