@@ -28,7 +28,7 @@ from app.models import (
     Tariff as TariffModel,
     User,
 )
-from app.payments import list_tariffs
+from app.payments import list_tariffs, robokassa_debug_lines
 from app.texts import (
     DEFAULT_BOT_TEXTS,
     get_bot_text,
@@ -1029,6 +1029,15 @@ async def debug_payment_ui_handler(message: Message, session: AsyncSession) -> N
         "subscription_no_access:\n"
         f"{subscription_text}"
     )
+
+
+@router.message(Command("debug_robokassa"))
+async def debug_robokassa_handler(message: Message, session: AsyncSession) -> None:
+    if not is_admin(message.from_user.id):
+        await message.answer("Недоступно.")
+        return
+
+    await message.answer("Robokassa Debug:\n" + "\n".join(robokassa_debug_lines()))
 
 
 @router.message(Command("admin_stats"))

@@ -332,6 +332,16 @@ Fail URL: https://your-railway-url/robokassa/fail
 
 Для диагностики администратор из `ADMIN_IDS` может вызвать `/debug_payments`.
 
+## Если Robokassa не активирует подписку
+
+1. Проверьте Railway logs: Result URL теперь пишет method, query, body, `OutSum`, `InvId`, полученную и рассчитанную подпись.
+2. Откройте `https://your-railway-url/health`: должен быть ответ `OK`.
+3. Откройте `https://your-railway-url/debug/robokassa`: проверьте, что включена Робокасса, задан `PUBLIC_BASE_URL`, есть merchant login, password1 и password2.
+4. В кабинете Робокассы проверьте Result URL: `https://your-railway-url/robokassa/result`.
+5. Проверьте метод Result URL: поддерживаются `POST` и `GET`.
+6. Если в логах `bad signature`, проверьте `ROBOKASSA_PASSWORD2`: для Result URL используется именно password2.
+7. Команда администратора `/debug_robokassa` показывает те же настройки без паролей.
+
 ## Проверка
 
 1. Отправьте `/start`: появится главное меню с кнопками `🔎 Узнать шрифт`, `💳 Подписка`, `👤 Профиль`; trial ещё не должен начаться.

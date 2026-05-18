@@ -289,10 +289,18 @@ def verify_robokassa_result_signature(
     inv_id: str,
     signature_value: str,
 ) -> bool:
-    if not settings.robokassa_password2.strip():
-        return False
+    expected_signature = calculate_robokassa_result_signature(out_sum, inv_id)
+    return (
+        bool(expected_signature)
+        and expected_signature.lower() == signature_value.lower()
+    )
 
-    expected_signature = make_md5_signature(
+
+def calculate_robokassa_result_signature(out_sum: str, inv_id: str) -> str:
+    if not settings.robokassa_password2.strip():
+        return ""
+
+    return make_md5_signature(
         ":".join(
             (
                 out_sum,
@@ -301,7 +309,36 @@ def verify_robokassa_result_signature(
             )
         )
     )
-    return expected_signature.lower() == signature_value.lower()
+
+
+def robokassa_webhook_urls() -> dict[str, str]:
+    public_base_url = settings.public_base_url.strip().rstrip("/")
+    if not public_base_url:
+        return {
+            "result_url": "",
+            "success_url": "",
+            "fail_url": "",
+        }
+    return {
+        "result_url": f"{public_base_url}/robokassa/result",
+        "success_url": f"{public_base_url}/robokassa/success",
+        "fail_url": f"{public_base_url}/robokassa/fail",
+    }
+
+
+def robokassa_debug_lines() -> list[str]:
+    urls = robokassa_webhook_urls()
+    return [
+        f"ROBOKASSA_ENABLED={settings.robokassa_enabled}",
+        f"ROBOKASSA_TEST_MODE={settings.robokassa_test_mode}",
+        f"PUBLIC_BASE_URL={settings.public_base_url.strip()}",
+        f"Result URL={urls['result_url']}",
+        f"Success URL={urls['success_url']}",
+        f"Fail URL={urls['fail_url']}",
+        f"merchant_login_exists={bool(settings.robokassa_merchant_login.strip())}",
+        f"password1_exists={bool(settings.robokassa_password1.strip())}",
+        f"password2_exists={bool(settings.robokassa_password2.strip())}",
+    ]
 
 
 async def create_robokassa_payment(

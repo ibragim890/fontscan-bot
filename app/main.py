@@ -16,8 +16,10 @@ from app.db import DbSessionMiddleware, async_session_factory, engine, init_db
 from app.handlers import admin, payments, photo, start, status, support
 from app.models import ExternalPayment, ExternalPaymentIntent, User
 from app.payments import (
+    calculate_robokassa_result_signature,
     ensure_send_invoice_subscription_period_support,
     get_tariff,
+    robokassa_debug_lines,
     verify_robokassa_result_signature,
 )
 
@@ -31,6 +33,17 @@ def configure_logging() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+
+@web_app.exception_handler(Exception)
+async def fastapi_exception_handler(request: Request, exc: Exception) -> PlainTextResponse:
+    logger.exception(
+        "Unhandled FastAPI exception: method=%s url=%s error=%s",
+        request.method,
+        request.url,
+        exc.__class__.__name__,
+    )
+    return PlainTextResponse("internal error")
 
 
 async def read_robokassa_params(request: Request) -> tuple[dict[str, str], str]:
@@ -55,104 +68,184 @@ async def read_robokassa_params(request: Request) -> tuple[dict[str, str], str]:
     return params, raw_body
 
 
+@web_app.get("/health")
+async def health() -> PlainTextResponse:
+    return PlainTextResponse("OK")
+
+
+@web_app.get("/debug/robokassa")
+async def debug_robokassa() -> PlainTextResponse:
+    try:
+        return PlainTextResponse("\n".join(robokassa_debug_lines()))
+    except Exception:
+        logger.exception("Failed to render Robokassa debug endpoint")
+        return PlainTextResponse("internal error")
+
+
 @web_app.api_route("/robokassa/result", methods=["GET", "POST"])
 async def robokassa_result(request: Request) -> PlainTextResponse:
-    params, raw_body = await read_robokassa_params(request)
-    out_sum = params.get("OutSum", "")
-    inv_id_raw = params.get("InvId", "")
-    signature_value = params.get("SignatureValue", "")
-
-    if not out_sum or not inv_id_raw or not signature_value:
-        return PlainTextResponse("bad sign")
-
-    if not verify_robokassa_result_signature(
-        out_sum,
-        inv_id_raw,
-        signature_value,
-    ):
-        logger.warning("Robokassa result rejected: bad signature inv_id=%s", inv_id_raw)
-        return PlainTextResponse("bad sign")
-
     try:
-        inv_id = int(inv_id_raw)
-    except ValueError:
-        return PlainTextResponse("order not found")
-
-    async with async_session_factory() as session:
-        intent = await session.get(ExternalPaymentIntent, inv_id)
-        if intent is None or intent.provider != "robokassa":
-            return PlainTextResponse("order not found")
-
-        if intent.status == "paid":
-            return PlainTextResponse(f"OK{inv_id_raw}")
-
-        plan = await get_tariff(session, intent.tariff, active_only=False)
-        if plan is None:
-            return PlainTextResponse("order not found")
-
-        user_result = await session.execute(
-            select(User).where(User.telegram_id == intent.telegram_id)
+        params, raw_body = await read_robokassa_params(request)
+        out_sum = params.get("OutSum", "")
+        inv_id_raw = params.get("InvId", "")
+        signature_value = params.get("SignatureValue", "")
+        calculated_signature = calculate_robokassa_result_signature(
+            out_sum,
+            inv_id_raw,
         )
-        user = user_result.scalar_one_or_none()
-        if user is None:
-            user = User(telegram_id=intent.telegram_id)
-            session.add(user)
-            await session.flush()
-
-        payment = ExternalPayment(
-            provider="robokassa",
-            telegram_id=intent.telegram_id,
-            tariff=plan.code,
-            amount_rub=intent.amount_rub,
-            inv_id=inv_id,
-            out_sum=out_sum,
-            signature_value=signature_value,
-            raw_payload=json.dumps(
-                {
-                    "method": request.method,
-                    "query": dict(request.query_params),
-                    "body": raw_body,
-                    "params": params,
-                },
-                ensure_ascii=False,
-            ),
+        signature_matches = verify_robokassa_result_signature(
+            out_sum,
+            inv_id_raw,
+            signature_value,
         )
-        session.add(payment)
-        intent.status = "paid"
-        intent.provider_invoice_id = inv_id_raw
-        intent.paid_at = now_utc()
-        activate_plan(user, plan.code, plan.monthly_limit)
-        await session.commit()
 
-    bot = getattr(request.app.state, "bot", None)
-    if bot is not None:
+        logger.info(
+            "Robokassa result request: method=%s query_params=%s body=%s "
+            "out_sum=%s inv_id=%s signature_value=%s signature_match=%s",
+            request.method,
+            dict(request.query_params),
+            raw_body,
+            out_sum,
+            inv_id_raw,
+            signature_value,
+            signature_matches,
+        )
+        logger.info(
+            "Robokassa signature debug: out_sum=%s inv_id=%s received=%s calculated=%s",
+            out_sum,
+            inv_id_raw,
+            signature_value,
+            calculated_signature,
+        )
+
+        if not out_sum or not inv_id_raw or not signature_value:
+            logger.warning("Robokassa result rejected: missing required params")
+            return PlainTextResponse("bad sign")
+
+        if not signature_matches:
+            logger.warning(
+                "Robokassa result rejected: bad signature inv_id=%s",
+                inv_id_raw,
+            )
+            return PlainTextResponse("bad sign")
+
         try:
-            await bot.send_message(
-                intent.telegram_id,
-                "Оплата прошла ✅\n\n"
-                f"Тариф: {plan.title}\n"
-                "Доступ активирован на 30 дней.\n"
-                f"Распознаваний: {plan.monthly_limit}\n\n"
-                "Теперь отправьте фото со шрифтом.",
-            )
-        except Exception as exc:
-            logger.exception(
-                "Failed to notify user about Robokassa payment: user=%s error=%s",
-                intent.telegram_id,
-                exc.__class__.__name__,
-            )
+            inv_id = int(inv_id_raw)
+        except ValueError:
+            logger.warning("Robokassa result rejected: invalid InvId=%s", inv_id_raw)
+            return PlainTextResponse("order not found")
 
-    return PlainTextResponse(f"OK{inv_id_raw}")
+        try:
+            async with async_session_factory() as session:
+                intent = await session.get(ExternalPaymentIntent, inv_id)
+                if intent is None or intent.provider != "robokassa":
+                    logger.warning("Robokassa order not found: inv_id=%s", inv_id)
+                    return PlainTextResponse("order not found")
+
+                if intent.status == "paid":
+                    logger.info("Robokassa order already paid: inv_id=%s", inv_id)
+                    return PlainTextResponse(f"OK{inv_id_raw}")
+
+                plan = await get_tariff(session, intent.tariff, active_only=False)
+                if plan is None:
+                    logger.error(
+                        "Robokassa order tariff not found: inv_id=%s tariff=%s",
+                        inv_id,
+                        intent.tariff,
+                    )
+                    return PlainTextResponse("order not found")
+
+                user_result = await session.execute(
+                    select(User).where(User.telegram_id == intent.telegram_id)
+                )
+                user = user_result.scalar_one_or_none()
+                if user is None:
+                    user = User(telegram_id=intent.telegram_id)
+                    session.add(user)
+                    await session.flush()
+
+                payment = ExternalPayment(
+                    provider="robokassa",
+                    telegram_id=intent.telegram_id,
+                    tariff=plan.code,
+                    amount_rub=intent.amount_rub,
+                    inv_id=inv_id,
+                    out_sum=out_sum,
+                    signature_value=signature_value,
+                    raw_payload=json.dumps(
+                        {
+                            "method": request.method,
+                            "query": dict(request.query_params),
+                            "body": raw_body,
+                            "params": params,
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+                session.add(payment)
+                intent.status = "paid"
+                intent.provider_invoice_id = inv_id_raw
+                intent.paid_at = now_utc()
+
+                try:
+                    activate_plan(user, plan.code, plan.monthly_limit)
+                except Exception:
+                    logger.exception(
+                        "Robokassa activate_plan failed: inv_id=%s user=%s tariff=%s",
+                        inv_id,
+                        intent.telegram_id,
+                        plan.code,
+                    )
+                    await session.rollback()
+                    return PlainTextResponse("internal error")
+
+                await session.commit()
+                telegram_id = intent.telegram_id
+                tariff_title = plan.title
+                monthly_limit = plan.monthly_limit
+        except Exception:
+            logger.exception("Robokassa result DB processing failed")
+            return PlainTextResponse("internal error")
+
+        bot = getattr(request.app.state, "bot", None)
+        if bot is not None:
+            try:
+                await bot.send_message(
+                    telegram_id,
+                    "Оплата прошла ✅\n\n"
+                    f"Тариф: {tariff_title}\n"
+                    "Доступ активирован на 30 дней.\n"
+                    f"Распознаваний: {monthly_limit}\n\n"
+                    "Теперь отправьте фото со шрифтом.",
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to notify user about Robokassa payment: user=%s",
+                    telegram_id,
+                )
+
+        return PlainTextResponse(f"OK{inv_id_raw}")
+    except Exception:
+        logger.exception("Robokassa result endpoint failed")
+        return PlainTextResponse("internal error")
 
 
 @web_app.get("/robokassa/success")
 async def robokassa_success() -> HTMLResponse:
-    return HTMLResponse("Оплата прошла. Можно вернуться в Telegram.")
+    try:
+        return HTMLResponse("Оплата прошла успешно.<br>Вернитесь в Telegram.")
+    except Exception:
+        logger.exception("Robokassa success endpoint failed")
+        return HTMLResponse("Оплата прошла успешно.<br>Вернитесь в Telegram.")
 
 
 @web_app.get("/robokassa/fail")
 async def robokassa_fail() -> HTMLResponse:
-    return HTMLResponse("Оплата не завершена. Попробуйте ещё раз в Telegram.")
+    try:
+        return HTMLResponse("Оплата не завершена.<br>Попробуйте ещё раз.")
+    except Exception:
+        logger.exception("Robokassa fail endpoint failed")
+        return HTMLResponse("Оплата не завершена.<br>Попробуйте ещё раз.")
 
 
 def build_dispatcher() -> Dispatcher:
@@ -188,6 +281,16 @@ async def start_bot_polling(bot: Bot, dp: Dispatcher) -> None:
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 
+async def run_logged_task(name: str, coro: object) -> None:
+    try:
+        await coro
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("%s task failed", name)
+        raise
+
+
 async def run() -> None:
     configure_logging()
 
@@ -206,8 +309,8 @@ async def run() -> None:
     tasks: list[asyncio.Task[object]] = []
     try:
         tasks = [
-            asyncio.create_task(start_bot_polling(bot, dp)),
-            asyncio.create_task(start_web_server()),
+            asyncio.create_task(run_logged_task("polling", start_bot_polling(bot, dp))),
+            asyncio.create_task(run_logged_task("uvicorn", start_web_server())),
         ]
         await asyncio.gather(*tasks)
     finally:
