@@ -131,6 +131,8 @@ async def card_payment_callback(
     await callback.message.answer(
         "Оплата картой\n\n"
         f"Тариф: {plan.title}\n"
+        "Срок доступа: 30 дней\n"
+        f"Распознаваний: {plan.monthly_limit}\n\n"
         "После оплаты подписка активируется автоматически.",
         reply_markup=card_payment_keyboard(invoice_url),
     )
@@ -281,7 +283,7 @@ async def debug_payments_handler(message: Message, session: AsyncSession) -> Non
             f"payload={intent.payload}\n"
             f"telegram_id={intent.telegram_id}\n"
             f"tariff={intent.tariff}\n"
-            f"amount_stars={intent.amount_stars}\n"
+            f"legacy_xtr_amount={intent.amount_stars}\n"
             f"status={intent.status}\n"
             f"created_at={intent.created_at}"
         )
@@ -291,7 +293,7 @@ async def debug_payments_handler(message: Message, session: AsyncSession) -> Non
         (
             f"telegram_id={payment.telegram_id}\n"
             f"tariff={payment.tariff}\n"
-            f"amount_stars={payment.amount_stars}\n"
+            f"legacy_xtr_amount={payment.amount_stars}\n"
             f"currency={payment.currency}\n"
             f"created_at={payment.created_at}"
         )
@@ -302,7 +304,7 @@ async def debug_payments_handler(message: Message, session: AsyncSession) -> Non
         f"aiogram version: {aiogram.__version__}\n\n"
         "tariffs:\n"
         + "\n".join(
-            f"{tariff.code}: {tariff.price_stars} Stars, "
+            f"{tariff.code}: {tariff.price_stars} ₽, "
             f"{tariff.monthly_limit} распознаваний"
             for tariff in tariffs
         )

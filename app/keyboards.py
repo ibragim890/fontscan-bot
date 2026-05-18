@@ -85,14 +85,7 @@ def subscription_menu_keyboard(
     if user_has_active_paid_plan:
         return back_to_menu_keyboard()
 
-    rows = [
-        [
-            InlineKeyboardButton(
-                text="Оплатить Designer Stars",
-                callback_data="pay:designer",
-            )
-        ],
-    ]
+    rows = []
     if settings.robokassa_enabled:
         rows.append(
             [
@@ -102,15 +95,6 @@ def subscription_menu_keyboard(
                 )
             ]
         )
-    rows.append(
-        [
-            InlineKeyboardButton(
-                text="Оплатить Studio Stars",
-                callback_data="pay:studio",
-            )
-        ]
-    )
-    if settings.robokassa_enabled:
         rows.append(
             [
                 InlineKeyboardButton(

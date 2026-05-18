@@ -131,7 +131,9 @@ async def robokassa_result(request: Request) -> PlainTextResponse:
                 intent.telegram_id,
                 "Оплата прошла ✅\n\n"
                 f"Тариф: {plan.title}\n"
-                "Доступ активирован на 30 дней.",
+                "Доступ активирован на 30 дней.\n"
+                f"Распознаваний: {plan.monthly_limit}\n\n"
+                "Теперь отправьте фото со шрифтом.",
             )
         except Exception as exc:
             logger.exception(

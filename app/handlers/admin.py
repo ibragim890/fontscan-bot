@@ -399,8 +399,8 @@ async def build_secret_stats(session: AsyncSession) -> str:
         "Оплаты:\n"
         f"Платежей всего: {payments_total or 0}\n"
         f"Платежей сегодня: {payments_today or 0}\n"
-        f"Stars всего: {stars_total or 0}\n"
-        f"Stars сегодня: {stars_today or 0}\n\n"
+        f"Legacy XTR всего: {stars_total or 0}\n"
+        f"Legacy XTR сегодня: {stars_today or 0}\n\n"
         "WhatFontIs:\n"
         + "\n".join(usage_lines)
         + "\n\n"
@@ -880,7 +880,7 @@ async def set_price_handler(message: Message, session: AsyncSession) -> None:
     )
     await message.answer(
         f"Цена тарифа {tariff.title} обновлена:\n"
-        f"{price} Stars"
+        f"{price} ₽"
     )
 
 
@@ -977,7 +977,7 @@ async def tariffs_handler(message: Message, session: AsyncSession) -> None:
     tariff_blocks = [
         (
             f"{tariff.title}:\n"
-            f"Цена: {tariff.price_stars} Stars\n"
+            f"Цена: {tariff.price_stars} ₽\n"
             f"Лимит: {tariff.monthly_limit}"
         )
         for tariff in tariffs

@@ -250,11 +250,18 @@ async def get_main_menu_text(session: AsyncSession) -> str:
 
 
 async def get_no_access_text(session: AsyncSession) -> str:
-    return await get_bot_text(
+    text = await get_bot_text(
         session,
         "no_access",
         **(await get_tariff_text_values(session)),
     )
+    return with_card_payment_unavailable_notice(text)
+
+
+def with_card_payment_unavailable_notice(text: str) -> str:
+    if settings.robokassa_enabled:
+        return text
+    return text + "\n\nОплата картой временно недоступна."
 
 
 async def get_profile_text(
@@ -326,7 +333,7 @@ async def get_subscription_text(session: AsyncSession, user: User) -> str:
 
     if user_has_active_trial(user, trial_config.requests_limit):
         days_left, hours_left = duration_parts_until(user.trial_ends_at)
-        return await get_bot_text(
+        text = await get_bot_text(
             session,
             "subscription_trial",
             status="Trial",
@@ -339,13 +346,15 @@ async def get_subscription_text(session: AsyncSession, user: User) -> str:
             limit=trial_config.requests_limit,
             **(await get_tariff_text_values(session)),
         )
+        return with_card_payment_unavailable_notice(text)
 
-    return await get_bot_text(
+    text = await get_bot_text(
         session,
         "subscription_no_access",
         status="Нет активного доступа",
         **(await get_tariff_text_values(session)),
     )
+    return with_card_payment_unavailable_notice(text)
 
 
 def normalize_subscription_expiration(value: object) -> datetime | None:
