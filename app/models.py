@@ -71,6 +71,29 @@ class PaymentIntent(Base):
     )
 
 
+class ExternalPaymentIntent(Base):
+    __tablename__ = "external_payment_intents"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    provider: Mapped[str] = mapped_column(String(32), default="robokassa")
+    telegram_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    tariff: Mapped[str] = mapped_column(String(32))
+    amount_rub: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(32), default="pending")
+    invoice_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    provider_invoice_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        onupdate=utc_now,
+    )
+    paid_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+
 class Payment(Base):
     __tablename__ = "payments"
 
@@ -95,6 +118,21 @@ class Payment(Base):
     )
     is_recurring: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     is_first_recurring: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class ExternalPayment(Base):
+    __tablename__ = "external_payments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    provider: Mapped[str] = mapped_column(String(32), default="robokassa")
+    telegram_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    tariff: Mapped[str] = mapped_column(String(32))
+    amount_rub: Mapped[int] = mapped_column(Integer)
+    inv_id: Mapped[int] = mapped_column(Integer, index=True)
+    out_sum: Mapped[str] = mapped_column(String(64))
+    signature_value: Mapped[str] = mapped_column(String(255))
+    raw_payload: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 

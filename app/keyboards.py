@@ -1,5 +1,7 @@
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from app.config import settings
+
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -83,28 +85,49 @@ def subscription_menu_keyboard(
     if user_has_active_paid_plan:
         return back_to_menu_keyboard()
 
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+    rows = [
+        [
+            InlineKeyboardButton(
+                text="Оплатить Designer Stars",
+                callback_data="pay:designer",
+            )
+        ],
+    ]
+    if settings.robokassa_enabled:
+        rows.append(
             [
                 InlineKeyboardButton(
-                    text="Оплатить Designer",
-                    callback_data="pay:designer",
+                    text="Оплатить Designer картой",
+                    callback_data="pay_card:designer",
                 )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="Оплатить Studio",
-                    callback_data="pay:studio",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Назад",
-                    callback_data="menu:main",
-                )
-            ],
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="Оплатить Studio Stars",
+                callback_data="pay:studio",
+            )
         ]
     )
+    if settings.robokassa_enabled:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="Оплатить Studio картой",
+                    callback_data="pay_card:studio",
+                )
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="⬅️ Назад",
+                callback_data="menu:main",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def cancel_subscription_keyboard() -> InlineKeyboardMarkup:
@@ -131,6 +154,19 @@ def invoice_link_keyboard(tariff_title: str, invoice_link: str) -> InlineKeyboar
                 InlineKeyboardButton(
                     text=f"Оплатить {tariff_title}",
                     url=invoice_link,
+                )
+            ]
+        ]
+    )
+
+
+def card_payment_keyboard(invoice_url: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Оплатить картой",
+                    url=invoice_url,
                 )
             ]
         ]

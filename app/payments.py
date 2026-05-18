@@ -1,8 +1,10 @@
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from hashlib import md5
 from inspect import signature
 from typing import Any
+from urllib.parse import urlencode
 from uuid import uuid4
 
 from aiogram import Bot
@@ -12,7 +14,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.models import Payment, PaymentIntent, Tariff as TariffModel, User
+from app.models import (
+    ExternalPaymentIntent,
+    Payment,
+    PaymentIntent,
+    Tariff as TariffModel,
+    User,
+)
 
 logger = logging.getLogger(__name__)
 SUBSCRIPTION_PERIOD_SECONDS = settings.subscription_period
@@ -40,6 +48,10 @@ class InvoiceDeliveryResult:
 
 
 class InvoiceCreationError(RuntimeError):
+    pass
+
+
+class RobokassaPaymentUnavailableError(RuntimeError):
     pass
 
 
@@ -227,6 +239,98 @@ def normalize_telegram_datetime(value: object) -> datetime | None:
     if isinstance(value, (int, float)):
         return datetime.fromtimestamp(value, timezone.utc)
     return None
+
+
+def robokassa_payment_enabled() -> bool:
+    return settings.robokassa_enabled
+
+
+def robokassa_payment_available() -> bool:
+    return settings.robokassa_enabled and settings.robokassa_is_configured
+
+
+def make_md5_signature(value: str) -> str:
+    return md5(value.encode("utf-8")).hexdigest()
+
+
+def make_robokassa_payment_url(
+    intent: ExternalPaymentIntent,
+    tariff_title: str,
+) -> str:
+    out_sum = str(intent.amount_rub)
+    inv_id = str(intent.id)
+    signature_value = make_md5_signature(
+        ":".join(
+            (
+                settings.robokassa_merchant_login.strip(),
+                out_sum,
+                inv_id,
+                settings.robokassa_password1.strip(),
+            )
+        )
+    )
+    params = {
+        "MerchantLogin": settings.robokassa_merchant_login.strip(),
+        "OutSum": out_sum,
+        "InvId": inv_id,
+        "Description": f"Подписка {tariff_title} на 30 дней",
+        "SignatureValue": signature_value,
+        "Culture": "ru",
+        "Encoding": "utf-8",
+    }
+    if settings.robokassa_test_mode:
+        params["IsTest"] = "1"
+
+    return f"{settings.robokassa_base_url.strip()}?{urlencode(params)}"
+
+
+def verify_robokassa_result_signature(
+    out_sum: str,
+    inv_id: str,
+    signature_value: str,
+) -> bool:
+    if not settings.robokassa_password2.strip():
+        return False
+
+    expected_signature = make_md5_signature(
+        ":".join(
+            (
+                out_sum,
+                inv_id,
+                settings.robokassa_password2.strip(),
+            )
+        )
+    )
+    return expected_signature.lower() == signature_value.lower()
+
+
+async def create_robokassa_payment(
+    session: AsyncSession,
+    telegram_id: int,
+    tariff_code: str,
+) -> str:
+    if not robokassa_payment_available():
+        raise RobokassaPaymentUnavailableError("Robokassa payment is unavailable")
+
+    plan = await get_tariff(session, tariff_code)
+    if plan is None:
+        raise ValueError("Unknown tariff")
+
+    price_rub = plan.price_stars
+    intent = ExternalPaymentIntent(
+        provider="robokassa",
+        telegram_id=telegram_id,
+        tariff=plan.code,
+        amount_rub=price_rub,
+        status="pending",
+    )
+    session.add(intent)
+    await session.flush()
+
+    payment_url = make_robokassa_payment_url(intent, plan.title)
+    intent.invoice_url = payment_url
+    await session.flush()
+    return payment_url
 
 
 async def create_payment_intent(

@@ -32,6 +32,20 @@ class Settings(BaseSettings):
     support_username: str = Field(default="", alias="SUPPORT_USERNAME")
     terms_url: str = Field(default="", alias="TERMS_URL")
 
+    robokassa_enabled: bool = Field(default=False, alias="ROBOKASSA_ENABLED")
+    robokassa_merchant_login: str = Field(
+        default="",
+        alias="ROBOKASSA_MERCHANT_LOGIN",
+    )
+    robokassa_password1: str = Field(default="", alias="ROBOKASSA_PASSWORD1")
+    robokassa_password2: str = Field(default="", alias="ROBOKASSA_PASSWORD2")
+    robokassa_test_mode: bool = Field(default=True, alias="ROBOKASSA_TEST_MODE")
+    robokassa_base_url: str = Field(
+        default="https://auth.robokassa.ru/Merchant/Index.aspx",
+        alias="ROBOKASSA_BASE_URL",
+    )
+    public_base_url: str = Field(default="", alias="PUBLIC_BASE_URL")
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -61,6 +75,19 @@ class Settings(BaseSettings):
             if raw_key:
                 keys.append(raw_key)
         return keys
+
+    @property
+    def robokassa_is_configured(self) -> bool:
+        return all(
+            value.strip()
+            for value in (
+                self.robokassa_merchant_login,
+                self.robokassa_password1,
+                self.robokassa_password2,
+                self.public_base_url,
+                self.robokassa_base_url,
+            )
+        )
 
 
 @lru_cache(maxsize=1)

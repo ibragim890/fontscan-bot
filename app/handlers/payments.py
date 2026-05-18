@@ -14,13 +14,16 @@ from app.access import (
     user_has_current_paid_subscription,
 )
 from app.keyboards import (
+    card_payment_keyboard,
     cancel_subscription_keyboard,
     invoice_link_keyboard,
     main_menu_keyboard,
     subscription_menu_keyboard,
 )
 from app.payments import (
+    RobokassaPaymentUnavailableError,
     create_payment_intent,
+    create_robokassa_payment,
     get_tariff,
     list_tariffs,
     save_successful_payment,
@@ -90,6 +93,48 @@ async def subscribe_callback(callback: CallbackQuery, session: AsyncSession) -> 
         )
         await callback.message.answer("Не удалось создать счёт. Попробуйте позже.")
         await callback.answer()
+
+
+@router.callback_query(F.data.startswith("pay_card:"))
+async def card_payment_callback(
+    callback: CallbackQuery,
+    session: AsyncSession,
+) -> None:
+    user = await get_or_create_user(session, callback.from_user)
+    if user_has_current_paid_subscription(user):
+        await callback.answer(
+            "У вас уже есть активная подписка.",
+            show_alert=True,
+        )
+        return
+
+    tariff = callback.data.split(":", maxsplit=1)[1]
+    plan = await get_tariff(session, tariff)
+    if plan is None:
+        await callback.answer("Тариф не найден.", show_alert=True)
+        return
+
+    try:
+        invoice_url = await create_robokassa_payment(
+            session,
+            callback.from_user.id,
+            plan.code,
+        )
+        await session.commit()
+    except RobokassaPaymentUnavailableError:
+        await callback.answer(
+            "Оплата картой временно недоступна.",
+            show_alert=True,
+        )
+        return
+
+    await callback.message.answer(
+        "Оплата картой\n\n"
+        f"Тариф: {plan.title}\n"
+        "После оплаты подписка активируется автоматически.",
+        reply_markup=card_payment_keyboard(invoice_url),
+    )
+    await callback.answer()
 
 
 @router.pre_checkout_query()
