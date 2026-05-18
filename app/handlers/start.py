@@ -7,12 +7,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.access import (
     get_or_create_user,
+    get_profile_text,
     get_subscription_text,
     user_has_current_paid_subscription,
 )
 from app.keyboards import (
     back_to_menu_keyboard,
     main_menu_keyboard,
+    profile_keyboard,
     subscription_menu_keyboard,
 )
 from app.texts import (
@@ -84,5 +86,19 @@ async def subscription_menu_handler(
         reply_markup=subscription_menu_keyboard(
             user_has_current_paid_subscription(user)
         ),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "menu:profile")
+async def profile_menu_handler(
+    callback: CallbackQuery,
+    session: AsyncSession,
+) -> None:
+    user = await get_or_create_user(session, callback.from_user)
+    await edit_or_answer(
+        callback,
+        get_profile_text(user),
+        reply_markup=profile_keyboard(),
     )
     await callback.answer()

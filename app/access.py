@@ -144,29 +144,63 @@ def increment_usage(user: User) -> None:
 
 
 def get_status_text(user: User) -> str:
+    return get_profile_text(user, include_title=False)
+
+
+def get_profile_text(user: User, include_title: bool = True) -> str:
+    prefix = "Профиль\n\n" if include_title else ""
+
     if user_has_current_paid_subscription(user):
         title = tariff_title(user.plan)
-        return (
-            f"Статус: {title}\n"
-            f"Доступ до: {format_date(user.plan_ends_at)}\n"
+        if user.subscription_canceled:
+            return prefix + (
+                f"Статус: {title} ✅\n"
+                "Продление отменено\n"
+                f"Доступ активен до: {format_date(user.plan_ends_at)}\n"
+                f"Осталось дней: {days_left_until(user.plan_ends_at)}\n"
+                f"Распознаваний осталось: "
+                f"{remaining_paid_requests(user)} / {user.monthly_requests_limit}"
+            )
+
+        return prefix + (
+            f"Статус: {title} ✅\n"
+            f"Подписка активна до: {format_date(user.plan_ends_at)}\n"
+            f"Осталось дней: {days_left_until(user.plan_ends_at)}\n"
             f"Распознаваний осталось: "
             f"{remaining_paid_requests(user)} / {user.monthly_requests_limit}"
         )
 
     if user_has_active_trial(user):
-        return (
+        return prefix + (
             "Статус: Trial\n"
             f"Осталось: {format_duration_until(user.trial_ends_at)}\n"
             f"Распознаваний осталось: "
             f"{remaining_trial_requests(user)} / {settings.trial_requests_limit}"
         )
 
-    return "Статус: Нет активного доступа"
+    if user.trial_started_at is not None:
+        return prefix + (
+            "Статус: Нет активной подписки\n"
+            "Пробный доступ закончился.\n\n"
+            "Оформите подписку, чтобы продолжить."
+        )
+
+    return prefix + "Статус: Нет активного доступа"
 
 
 def get_subscription_text(user: User) -> str:
     if user_has_current_paid_subscription(user):
         title = tariff_title(user.plan)
+        if user.subscription_canceled:
+            return (
+                "Подписка\n\n"
+                f"Статус: {title} ✅\n"
+                "Продление отменено\n"
+                f"Доступ активен до: {format_date(user.plan_ends_at)}\n"
+                f"Распознаваний осталось: "
+                f"{remaining_paid_requests(user)} / {user.monthly_requests_limit}"
+            )
+
         return (
             "Подписка\n\n"
             f"Статус: {title} ✅\n"

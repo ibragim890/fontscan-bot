@@ -25,6 +25,8 @@ class Settings(BaseSettings):
 
     subscription_period: int = Field(default=2_592_000, alias="SUBSCRIPTION_PERIOD")
     daily_api_safety_limit: int = Field(default=90, alias="DAILY_API_SAFETY_LIMIT")
+    admin_secret_code: str = Field(default="", alias="ADMIN_SECRET_CODE")
+    admin_secret_enabled: bool = Field(default=True, alias="ADMIN_SECRET_ENABLED")
 
     support_username: str = Field(default="", alias="SUPPORT_USERNAME")
     terms_url: str = Field(default="", alias="TERMS_URL")

@@ -16,6 +16,12 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
                     callback_data="menu:subscription",
                 )
             ],
+            [
+                InlineKeyboardButton(
+                    text="👤 Профиль",
+                    callback_data="menu:profile",
+                )
+            ],
         ]
     )
 
@@ -46,6 +52,25 @@ def result_actions_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="💳 Подписка",
                     callback_data="menu:subscription",
+                )
+            ],
+        ]
+    )
+
+
+def profile_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="💳 Подписка",
+                    callback_data="menu:subscription",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data="menu:main",
                 )
             ],
         ]
