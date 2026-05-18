@@ -1,5 +1,6 @@
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
+import logging
 from typing import Any
 
 from aiogram import BaseMiddleware
@@ -8,6 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.orm import DeclarativeBase
 
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 class Base(DeclarativeBase):
@@ -26,6 +29,7 @@ async_session_factory = async_sessionmaker(
 async def init_db() -> None:
     import app.models  # noqa: F401
 
+    logger.info("Database init started")
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         columns = await conn.execute(text("PRAGMA table_info(font_requests)"))
@@ -102,6 +106,11 @@ async def init_db() -> None:
             {"key": FORCED_TEXT_UPDATE_KEY},
         )
         should_force_text_update = forced_update_exists.first() is None
+        logger.info(
+            "Bot text migration check: key=%s should_force_update=%s",
+            FORCED_TEXT_UPDATE_KEY,
+            should_force_text_update,
+        )
 
         for key, (title, text_value) in DEFAULT_BOT_TEXTS.items():
             await conn.execute(
@@ -122,7 +131,7 @@ async def init_db() -> None:
                 },
             )
             if should_force_text_update and key in FORCED_TEXT_UPDATE_KEYS:
-                await conn.execute(
+                result = await conn.execute(
                     text(
                         "UPDATE bot_texts "
                         "SET title = :title, text = :new_text, updated_at = :updated_at "
@@ -135,8 +144,32 @@ async def init_db() -> None:
                         "updated_at": now,
                     },
                 )
+                logger.info(
+                    "Bot text forced update: key=%s rows=%s",
+                    key,
+                    result.rowcount,
+                )
 
         if should_force_text_update:
+            main_menu_title, main_menu_text = DEFAULT_BOT_TEXTS["main_menu"]
+            result = await conn.execute(
+                text(
+                    "UPDATE bot_texts "
+                    "SET title = :title, text = :new_text, updated_at = :updated_at "
+                    "WHERE key = :key"
+                ),
+                {
+                    "key": "start_message",
+                    "title": main_menu_title,
+                    "new_text": main_menu_text,
+                    "updated_at": now,
+                },
+            )
+            logger.info(
+                "Bot text forced update alias: key=start_message rows=%s",
+                result.rowcount,
+            )
+
             await conn.execute(
                 text(
                     "INSERT INTO app_settings (key, value, updated_at) "
@@ -148,6 +181,11 @@ async def init_db() -> None:
                     "updated_at": now,
                 },
             )
+            logger.info(
+                "Bot text migration marker stored: key=%s",
+                FORCED_TEXT_UPDATE_KEY,
+            )
+    logger.info("Database init finished")
 
 
 class DbSessionMiddleware(BaseMiddleware):
