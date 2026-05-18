@@ -181,7 +181,7 @@ Studio — {price_studio} ₽ / {limit_studio} распознаваний""",
     ),
 }
 
-FORCED_TEXT_UPDATE_KEY = "bot_texts_card_payments_v3"
+FORCED_TEXT_UPDATE_KEY = "bot_texts_payment_rub_v1"
 FORCED_TEXT_UPDATE_KEYS = {
     "main_menu",
     "start_message",

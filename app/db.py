@@ -151,6 +151,42 @@ async def init_db() -> None:
                 )
 
         if should_force_text_update:
+            await conn.execute(
+                text(
+                    "UPDATE bot_texts "
+                    "SET text = replace(text, 'Telegram Stars', 'Робокассу'), "
+                    "updated_at = :updated_at "
+                    "WHERE text LIKE '%Telegram Stars%'"
+                ),
+                {"updated_at": now},
+            )
+            result = await conn.execute(
+                text(
+                    "UPDATE bot_texts "
+                    "SET text = replace(text, ' Stars', ' ₽'), "
+                    "updated_at = :updated_at "
+                    "WHERE text LIKE '% Stars%'"
+                ),
+                {"updated_at": now},
+            )
+            logger.info(
+                "Bot text Stars-to-rub cleanup: rows=%s",
+                result.rowcount,
+            )
+            result = await conn.execute(
+                text(
+                    "UPDATE bot_texts "
+                    "SET text = replace(text, 'Stars', '₽'), "
+                    "updated_at = :updated_at "
+                    "WHERE text LIKE '%Stars%'"
+                ),
+                {"updated_at": now},
+            )
+            logger.info(
+                "Bot text remaining Stars cleanup: rows=%s",
+                result.rowcount,
+            )
+
             main_menu_title, main_menu_text = DEFAULT_BOT_TEXTS["main_menu"]
             result = await conn.execute(
                 text(
