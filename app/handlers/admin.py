@@ -103,7 +103,7 @@ ALL_TEXT_VARIABLES = [
     "limit_designer",
     "price_studio",
     "limit_studio",
-    "font_title",
+    "font_name",
     "support_username",
 ]
 
@@ -138,7 +138,7 @@ TEXT_VARIABLES: dict[str, list[str]] = {
         "price_studio",
         "limit_studio",
     ],
-    "font_result_found": ["font_title"],
+    "font_result_found": ["font_name"],
     "font_result_not_found": [],
     "payment_success_designer": ["date", "limit", "tariff"],
     "payment_success_studio": ["date", "limit", "tariff"],

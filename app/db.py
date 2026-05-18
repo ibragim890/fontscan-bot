@@ -91,7 +91,17 @@ async def init_db() -> None:
                 {"key": key, "value": value, "updated_at": now},
             )
 
-        from app.texts import DEFAULT_BOT_TEXTS
+        from app.texts import (
+            DEFAULT_BOT_TEXTS,
+            FORCED_TEXT_UPDATE_KEY,
+            FORCED_TEXT_UPDATE_KEYS,
+        )
+
+        forced_update_exists = await conn.execute(
+            text("SELECT 1 FROM app_settings WHERE key = :key"),
+            {"key": FORCED_TEXT_UPDATE_KEY},
+        )
+        should_force_text_update = forced_update_exists.first() is None
 
         for key, (title, text_value) in DEFAULT_BOT_TEXTS.items():
             await conn.execute(
@@ -108,6 +118,33 @@ async def init_db() -> None:
                     "title": title,
                     "text": text_value,
                     "created_at": now,
+                    "updated_at": now,
+                },
+            )
+            if should_force_text_update and key in FORCED_TEXT_UPDATE_KEYS:
+                await conn.execute(
+                    text(
+                        "UPDATE bot_texts "
+                        "SET title = :title, text = :new_text, updated_at = :updated_at "
+                        "WHERE key = :key"
+                    ),
+                    {
+                        "key": key,
+                        "title": title,
+                        "new_text": text_value,
+                        "updated_at": now,
+                    },
+                )
+
+        if should_force_text_update:
+            await conn.execute(
+                text(
+                    "INSERT INTO app_settings (key, value, updated_at) "
+                    "VALUES (:key, :value, :updated_at)"
+                ),
+                {
+                    "key": FORCED_TEXT_UPDATE_KEY,
+                    "value": "1",
                     "updated_at": now,
                 },
             )

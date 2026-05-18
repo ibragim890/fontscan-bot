@@ -222,7 +222,7 @@ worker: python -m app.main
 {limit_designer}
 {price_studio}
 {limit_studio}
-{font_title}
+{font_name}
 {support_username}
 ```
 

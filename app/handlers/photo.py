@@ -23,6 +23,7 @@ from app.keyboards import no_access_subscription_keyboard, result_actions_keyboa
 from app.models import ApiKeyUsage, FontRequest
 from app.texts import (
     DOWNLOAD_ERROR_TEXT,
+    DOCUMENT_TEXT,
     NOT_PHOTO_TEXT,
     PROCESSING_TEXT,
     TEMP_UNAVAILABLE_TEXT,
@@ -226,3 +227,11 @@ async def non_photo_handler(message: Message) -> None:
         return
 
     await message.answer(NOT_PHOTO_TEXT)
+
+
+@router.message(F.document)
+async def document_handler(message: Message) -> None:
+    if message.caption and message.caption.lstrip().startswith("/"):
+        return
+
+    await message.answer(DOCUMENT_TEXT)
