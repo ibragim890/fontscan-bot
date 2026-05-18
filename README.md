@@ -66,6 +66,7 @@ STUDIO_PRICE_STARS=199
 STUDIO_MONTHLY_LIMIT=50
 
 SUBSCRIPTION_PERIOD=2592000
+SUBSCRIPTION_PRODUCT_ID=
 
 DAILY_API_SAFETY_LIMIT=90
 
@@ -124,6 +125,8 @@ DESIGNER_PRICE_STARS=99
 DESIGNER_MONTHLY_LIMIT=20
 STUDIO_PRICE_STARS=199
 STUDIO_MONTHLY_LIMIT=50
+SUBSCRIPTION_PERIOD=2592000
+SUBSCRIPTION_PRODUCT_ID=
 ```
 
 Railway запускает long polling worker через `Procfile`:
@@ -140,7 +143,8 @@ worker: python -m app.main
 
 - Валюта invoice: `XTR`.
 - `provider_token` пустой: `""`.
-- Для месячной подписки используется `subscription_period=2592000`.
+- Для месячной подписки используется `subscription_period=2592000`, только если задан `SUBSCRIPTION_PRODUCT_ID`.
+- Если `SUBSCRIPTION_PRODUCT_ID` пустой, бот отправляет обычный Stars invoice без `subscription_period`.
 - В invoice передаётся один `LabeledPrice`.
 - Payload уникален и имеет формат `sub:<tariff>:<telegram_id>:<uuid>`.
 - После оплаты Telegram присылает `successful_payment`.
@@ -290,8 +294,10 @@ worker: python -m app.main
 4. `provider_token=""`.
 5. `currency="XTR"`.
 6. `prices=[один LabeledPrice]`.
-7. `subscription_period=2592000`.
+7. Если нужна Stars-подписка, проверить `subscription_period=2592000` и `SUBSCRIPTION_PRODUCT_ID`.
 8. Реальную ошибку в консоли после `logger.exception`.
+
+Если Telegram возвращает `SUBSCRIPTION_EXPORT_MISSING`, у бота не настроен subscription product/export для Stars-подписки. Создайте subscription product/export в BotFather и задайте `SUBSCRIPTION_PRODUCT_ID`, либо оставьте `SUBSCRIPTION_PRODUCT_ID` пустым: тогда бот будет создавать обычный Stars invoice без автопродления.
 
 Для диагностики администратор из `ADMIN_IDS` может вызвать `/debug_payments`.
 

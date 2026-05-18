@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     studio_monthly_limit: int = Field(default=50, alias="STUDIO_MONTHLY_LIMIT")
 
     subscription_period: int = Field(default=2_592_000, alias="SUBSCRIPTION_PERIOD")
+    subscription_product_id: str = Field(default="", alias="SUBSCRIPTION_PRODUCT_ID")
     daily_api_safety_limit: int = Field(default=90, alias="DAILY_API_SAFETY_LIMIT")
     admin_secret_code: str = Field(default="", alias="ADMIN_SECRET_CODE")
     admin_secret_enabled: bool = Field(default=True, alias="ADMIN_SECRET_ENABLED")

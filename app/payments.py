@@ -17,6 +17,7 @@ from app.models import Payment, PaymentIntent, Tariff as TariffModel, User
 logger = logging.getLogger(__name__)
 SUBSCRIPTION_PERIOD_SECONDS = settings.subscription_period
 STARS_CURRENCY = "XTR"
+SUBSCRIPTION_EXPORT_MISSING = "SUBSCRIPTION_EXPORT_MISSING"
 
 
 @dataclass(frozen=True)
@@ -43,7 +44,11 @@ class InvoiceCreationError(RuntimeError):
 
 
 def ensure_send_invoice_subscription_period_support() -> None:
-    if "subscription_period" in signature(Bot.send_invoice).parameters:
+    parameters = signature(Bot.send_invoice).parameters
+    if (
+        "subscription_period" in parameters
+        and "subscription_product_id" in parameters
+    ):
         return
 
     async def send_invoice_with_subscription_period(
@@ -56,9 +61,12 @@ def ensure_send_invoice_subscription_period_support() -> None:
         prices: list[LabeledPrice],
         provider_token: str | None = None,
         subscription_period: int | None = None,
+        subscription_product_id: str | None = None,
         request_timeout: int | None = None,
         **extra_data: Any,
     ) -> Any:
+        if subscription_product_id:
+            extra_data["subscription_product_id"] = subscription_product_id
         return await self(
             SendInvoice(
                 chat_id=chat_id,
@@ -124,6 +132,51 @@ def provider_token_error(exc: Exception) -> bool:
     return "provider_token" in message or "provider token" in message
 
 
+def subscription_export_missing_error(exc: Exception) -> bool:
+    return SUBSCRIPTION_EXPORT_MISSING.lower() in str(exc).lower()
+
+
+def invoice_prices_for_log(invoice_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    prices = invoice_payload.get("prices") or []
+    return [
+        {
+            "label": getattr(price, "label", None),
+            "amount": getattr(price, "amount", None),
+        }
+        for price in prices
+    ]
+
+
+def log_invoice_payload(
+    stage: str,
+    chat_id: int | str | None,
+    payment_intent: PaymentIntent,
+    invoice_payload: dict[str, Any],
+) -> None:
+    logger.info(
+        "Stars invoice payload: stage=%s chat_id=%s tariff=%s amount=%s "
+        "payload=%s currency=%s provider_token_empty=%s prices=%s "
+        "subscription_period=%s subscription_product_id_present=%s",
+        stage,
+        chat_id,
+        payment_intent.tariff,
+        payment_intent.amount_stars,
+        payment_intent.payload,
+        invoice_payload.get("currency"),
+        invoice_payload.get("provider_token") == "",
+        invoice_prices_for_log(invoice_payload),
+        invoice_payload.get("subscription_period"),
+        bool(invoice_payload.get("subscription_product_id")),
+    )
+
+
+def without_subscription_fields(invoice_payload: dict[str, Any]) -> dict[str, Any]:
+    ordinary_payload = dict(invoice_payload)
+    ordinary_payload.pop("subscription_period", None)
+    ordinary_payload.pop("subscription_product_id", None)
+    return ordinary_payload
+
+
 def build_invoice_payload(plan: TariffPlan, payload: str) -> dict[str, Any]:
     title = f"{plan.title} подписка"
     description = plan.description
@@ -142,15 +195,26 @@ def build_invoice_payload(plan: TariffPlan, payload: str) -> dict[str, Any]:
         )
     ]
 
-    return {
+    invoice_payload: dict[str, Any] = {
         "title": title,
         "description": description,
         "payload": payload,
         "provider_token": "",
         "currency": STARS_CURRENCY,
         "prices": prices,
-        "subscription_period": SUBSCRIPTION_PERIOD_SECONDS,
     }
+
+    subscription_product_id = settings.subscription_product_id.strip()
+    if subscription_product_id:
+        invoice_payload["subscription_period"] = SUBSCRIPTION_PERIOD_SECONDS
+        invoice_payload["subscription_product_id"] = subscription_product_id
+    else:
+        logger.info(
+            "Telegram Stars subscription product is not configured; "
+            "sending ordinary Stars invoice without subscription_period"
+        )
+
+    return invoice_payload
 
 
 def normalize_telegram_datetime(value: object) -> datetime | None:
@@ -194,6 +258,7 @@ async def create_subscription_invoice_link(
     plan: TariffPlan,
     *,
     omit_provider_token: bool = False,
+    omit_subscription_fields: bool = False,
 ) -> str:
     invoice_payload = build_invoice_payload(
         plan,
@@ -201,7 +266,15 @@ async def create_subscription_invoice_link(
     )
     if omit_provider_token:
         invoice_payload.pop("provider_token", None)
+    if omit_subscription_fields:
+        invoice_payload = without_subscription_fields(invoice_payload)
 
+    log_invoice_payload(
+        "create_invoice_link",
+        None,
+        payment_intent,
+        invoice_payload,
+    )
     return await bot.create_invoice_link(**invoice_payload)
 
 
@@ -219,6 +292,12 @@ async def send_subscription_invoice(
     )
 
     try:
+        log_invoice_payload(
+            "send_invoice",
+            chat_id,
+            payment_intent,
+            invoice_payload,
+        )
         await bot.send_invoice(chat_id=chat_id, **invoice_payload)
         return InvoiceDeliveryResult(method="send_invoice")
     except Exception as send_exc:
@@ -229,10 +308,39 @@ async def send_subscription_invoice(
             payment_intent.payload,
             str(send_exc),
         )
+        if subscription_export_missing_error(send_exc):
+            ordinary_payload = without_subscription_fields(invoice_payload)
+            try:
+                log_invoice_payload(
+                    "send_invoice_without_subscription_fields",
+                    chat_id,
+                    payment_intent,
+                    ordinary_payload,
+                )
+                await bot.send_invoice(chat_id=chat_id, **ordinary_payload)
+                return InvoiceDeliveryResult(
+                    method="send_invoice_without_subscription_fields"
+                )
+            except Exception as ordinary_exc:
+                logger.exception(
+                    "send_invoice without subscription fields failed: "
+                    "tariff=%s amount=%s payload=%s error=%s",
+                    payment_intent.tariff,
+                    payment_intent.amount_stars,
+                    payment_intent.payload,
+                    str(ordinary_exc),
+                )
+
         if provider_token_error(send_exc):
             without_provider_token = dict(invoice_payload)
             without_provider_token.pop("provider_token", None)
             try:
+                log_invoice_payload(
+                    "send_invoice_without_provider_token",
+                    chat_id,
+                    payment_intent,
+                    without_provider_token,
+                )
                 await bot.send_invoice(chat_id=chat_id, **without_provider_token)
                 return InvoiceDeliveryResult(method="send_invoice_without_provider_token")
             except Exception as retry_exc:
@@ -264,6 +372,27 @@ async def send_subscription_invoice(
                 payment_intent.payload,
                 str(link_exc),
             )
+            if subscription_export_missing_error(link_exc):
+                try:
+                    invoice_link = await create_subscription_invoice_link(
+                        bot,
+                        payment_intent,
+                        plan,
+                        omit_subscription_fields=True,
+                    )
+                    return InvoiceDeliveryResult(
+                        method="create_invoice_link_without_subscription_fields",
+                        invoice_link=invoice_link,
+                    )
+                except Exception as link_ordinary_exc:
+                    logger.exception(
+                        "create_invoice_link without subscription fields failed: "
+                        "tariff=%s amount=%s payload=%s error=%s",
+                        payment_intent.tariff,
+                        payment_intent.amount_stars,
+                        payment_intent.payload,
+                        str(link_ordinary_exc),
+                    )
             if provider_token_error(link_exc):
                 try:
                     invoice_link = await create_subscription_invoice_link(
