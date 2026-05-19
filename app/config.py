@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     admin_ids: str = Field(default="", alias="ADMIN_IDS")
 
     trial_days: int = Field(default=2, alias="TRIAL_DAYS")
-    trial_requests_limit: int = Field(default=3, alias="TRIAL_REQUESTS_LIMIT")
+    trial_requests_limit: int = Field(default=1, alias="TRIAL_REQUESTS_LIMIT")
 
     designer_price_stars: int = Field(default=99, alias="DESIGNER_PRICE_STARS")
     designer_monthly_limit: int = Field(default=20, alias="DESIGNER_MONTHLY_LIMIT")

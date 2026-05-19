@@ -11,6 +11,7 @@ from app.access import (
     format_date,
     get_or_create_user,
     get_subscription_text,
+    user_has_active_paid_plan,
     user_has_current_paid_subscription,
 )
 from app.keyboards import (
@@ -44,7 +45,7 @@ async def subscribe_handler(message: Message, session: AsyncSession) -> None:
     await message.answer(
         await get_subscription_text(session, user),
         reply_markup=subscription_menu_keyboard(
-            user_has_current_paid_subscription(user)
+            user_has_active_paid_plan(user)
         ),
     )
 
@@ -52,7 +53,7 @@ async def subscribe_handler(message: Message, session: AsyncSession) -> None:
 @router.callback_query(F.data.startswith("pay:"))
 async def subscribe_callback(callback: CallbackQuery, session: AsyncSession) -> None:
     user = await get_or_create_user(session, callback.from_user)
-    if user_has_current_paid_subscription(user):
+    if user_has_active_paid_plan(user):
         await callback.answer(
             "У вас уже есть активная подписка.",
             show_alert=True,
@@ -101,7 +102,7 @@ async def card_payment_callback(
     session: AsyncSession,
 ) -> None:
     user = await get_or_create_user(session, callback.from_user)
-    if user_has_current_paid_subscription(user):
+    if user_has_active_paid_plan(user):
         await callback.answer(
             "У вас уже есть активная подписка.",
             show_alert=True,

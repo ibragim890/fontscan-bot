@@ -152,22 +152,17 @@ async def set_app_setting(
 
 async def get_trial_config(session: AsyncSession) -> TrialConfig:
     return TrialConfig(
-        days=await get_app_setting_int(session, "trial_days", settings.trial_days),
+        days=settings.trial_days,
         requests_limit=await get_app_setting_int(
             session,
-            "trial_requests_limit",
+            "trial_limit",
             settings.trial_requests_limit,
         ),
     )
 
 
 def start_trial_if_needed(user: User, trial_days: int | None = None) -> None:
-    if user.trial_started_at is None and user.plan == "none":
-        started_at = now_utc()
-        days = trial_days or settings.trial_days
-        user.trial_started_at = started_at
-        user.trial_ends_at = started_at + timedelta(days=days)
-        user.trial_requests_used = 0
+    return None
 
 
 def user_has_active_paid_plan(user: User) -> bool:
@@ -189,34 +184,40 @@ def user_has_current_paid_subscription(user: User) -> bool:
     )
 
 
-def user_has_active_trial(user: User, trial_requests_limit: int | None = None) -> bool:
-    trial_ends_at = as_utc(user.trial_ends_at)
+def user_has_trial_available(
+    user: User,
+    trial_requests_limit: int | None = None,
+) -> bool:
     requests_limit = trial_requests_limit or settings.trial_requests_limit
-    return (
-        user.trial_started_at is not None
-        and trial_ends_at is not None
-        and trial_ends_at > now_utc()
-        and user.trial_requests_used < requests_limit
+    plan_ends_at = as_utc(user.plan_ends_at)
+    has_current_paid_period = (
+        user.plan in PAID_PLAN_CODES
+        and plan_ends_at is not None
+        and plan_ends_at > now_utc()
     )
+    if has_current_paid_period:
+        return False
+
+    plan_allows_trial = user.plan is None or user.plan == "none"
+    return plan_allows_trial and user.trial_requests_used < requests_limit
 
 
 def user_can_make_request(user: User, trial_requests_limit: int | None = None) -> bool:
-    if user_has_current_paid_subscription(user):
-        return user_has_active_paid_plan(user)
+    if user_has_active_paid_plan(user):
+        return True
 
-    if user_has_active_trial(user, trial_requests_limit):
+    if user_has_trial_available(user, trial_requests_limit):
         return True
 
     return False
 
 
 def increment_usage(user: User, trial_requests_limit: int | None = None) -> None:
-    if user_has_current_paid_subscription(user):
-        if user_has_active_paid_plan(user):
-            user.monthly_requests_used += 1
+    if user_has_active_paid_plan(user):
+        user.monthly_requests_used += 1
         return
 
-    if user_has_active_trial(user, trial_requests_limit):
+    if user_has_trial_available(user, trial_requests_limit):
         user.trial_requests_used += 1
 
 
@@ -258,7 +259,8 @@ async def get_no_access_text(session: AsyncSession) -> str:
     text = append_rub_tariff_block(
         strip_payment_tariff_lines(base_text),
         await get_tariff_text_values(session),
-        include_month=False,
+        include_month=True,
+        terminal_period=False,
     )
     return with_card_payment_unavailable_notice(text)
 
@@ -273,7 +275,12 @@ def strip_payment_tariff_lines(text: str) -> str:
     return "\n".join(lines).strip()
 
 
-def rub_tariff_block(values: dict[str, object], *, include_month: bool = True) -> str:
+def rub_tariff_block(
+    values: dict[str, object],
+    *,
+    include_month: bool = True,
+    terminal_period: bool = True,
+) -> str:
     if not include_month:
         return (
             f"Designer — {values['price_designer']} ₽ / "
@@ -282,11 +289,12 @@ def rub_tariff_block(values: dict[str, object], *, include_month: bool = True) -
             f"{values['limit_studio']} распознаваний"
         )
     period = " / месяц"
+    line_end = "." if terminal_period else ""
     return (
         f"Designer — {values['price_designer']} ₽{period}, "
-        f"{values['limit_designer']} распознаваний.\n"
+        f"{values['limit_designer']} распознаваний{line_end}\n"
         f"Studio — {values['price_studio']} ₽{period}, "
-        f"{values['limit_studio']} распознаваний."
+        f"{values['limit_studio']} распознаваний{line_end}"
     )
 
 
@@ -296,8 +304,16 @@ def append_rub_tariff_block(
     *,
     include_month: bool = True,
     include_choose: bool = False,
+    terminal_period: bool = True,
 ) -> str:
-    parts = [text, rub_tariff_block(values, include_month=include_month)]
+    parts = [
+        text,
+        rub_tariff_block(
+            values,
+            include_month=include_month,
+            terminal_period=terminal_period,
+        ),
+    ]
     if include_choose:
         parts.append("Выберите тариф:")
     return "\n\n".join(part for part in parts if part)
@@ -342,14 +358,13 @@ async def get_profile_text(
             limit=user.monthly_requests_limit,
         )
 
-    if user_has_active_trial(user, trial_config.requests_limit):
-        days_left, hours_left = duration_parts_until(user.trial_ends_at)
+    if user_has_trial_available(user, trial_config.requests_limit):
         return await get_bot_text(
             session,
             "profile_trial" if include_title else "profile_trial",
-            status="Trial",
-            days_left=days_left,
-            hours_left=hours_left,
+            status="Бесплатный доступ",
+            days_left=0,
+            hours_left=0,
             remaining=remaining_trial_requests_for_limit(
                 user,
                 trial_config.requests_limit,
@@ -376,15 +391,14 @@ async def get_subscription_text(session: AsyncSession, user: User) -> str:
             limit=user.monthly_requests_limit,
         )
 
-    if user_has_active_trial(user, trial_config.requests_limit):
-        days_left, hours_left = duration_parts_until(user.trial_ends_at)
+    if user_has_trial_available(user, trial_config.requests_limit):
         tariff_values = await get_tariff_text_values(session)
         base_text = await get_bot_text(
             session,
             "subscription_trial",
-            status="Trial",
-            days_left=days_left,
-            hours_left=hours_left,
+            status="Бесплатный доступ",
+            days_left=0,
+            hours_left=0,
             remaining=remaining_trial_requests_for_limit(
                 user,
                 trial_config.requests_limit,
@@ -410,7 +424,6 @@ async def get_subscription_text(session: AsyncSession, user: User) -> str:
         strip_payment_tariff_lines(base_text),
         tariff_values,
         include_month=True,
-        include_choose=True,
     )
     return with_card_payment_unavailable_notice(text)
 

@@ -147,8 +147,7 @@ async def init_db() -> None:
             )
 
         default_settings = [
-            ("trial_days", str(settings.trial_days)),
-            ("trial_requests_limit", str(settings.trial_requests_limit)),
+            ("trial_limit", "1"),
         ]
         for key, value in default_settings:
             await conn.execute(
@@ -163,6 +162,7 @@ async def init_db() -> None:
             )
 
         from app.texts import (
+            ACCESS_TRIAL_TEXT_UPDATE_KEY,
             DEFAULT_BOT_TEXTS,
             FORCED_TEXT_UPDATE_KEY,
             FORCED_TEXT_UPDATE_KEYS,
@@ -173,10 +173,20 @@ async def init_db() -> None:
             {"key": FORCED_TEXT_UPDATE_KEY},
         )
         should_force_text_update = forced_update_exists.first() is None
+        access_trial_update_exists = await conn.execute(
+            text("SELECT 1 FROM app_settings WHERE key = :key"),
+            {"key": ACCESS_TRIAL_TEXT_UPDATE_KEY},
+        )
+        should_force_access_trial_update = access_trial_update_exists.first() is None
         logger.info(
             "Bot text migration check: key=%s should_force_update=%s",
             FORCED_TEXT_UPDATE_KEY,
             should_force_text_update,
+        )
+        logger.info(
+            "Access trial migration check: key=%s should_force_update=%s",
+            ACCESS_TRIAL_TEXT_UPDATE_KEY,
+            should_force_access_trial_update,
         )
 
         for key, (title, text_value) in DEFAULT_BOT_TEXTS.items():
@@ -197,7 +207,12 @@ async def init_db() -> None:
                     "updated_at": now,
                 },
             )
-            if should_force_text_update and key in FORCED_TEXT_UPDATE_KEYS:
+            should_update_text = (
+                should_force_text_update and key in FORCED_TEXT_UPDATE_KEYS
+            ) or (
+                should_force_access_trial_update and key in FORCED_TEXT_UPDATE_KEYS
+            )
+            if should_update_text:
                 result = await conn.execute(
                     text(
                         "UPDATE bot_texts "
@@ -234,6 +249,22 @@ async def init_db() -> None:
             logger.info(
                 "Bot text migration marker stored: key=%s",
                 FORCED_TEXT_UPDATE_KEY,
+            )
+        if should_force_access_trial_update:
+            await conn.execute(
+                text(
+                    "INSERT INTO app_settings (key, value, updated_at) "
+                    "VALUES (:key, :value, :updated_at)"
+                ),
+                {
+                    "key": ACCESS_TRIAL_TEXT_UPDATE_KEY,
+                    "value": "1",
+                    "updated_at": now,
+                },
+            )
+            logger.info(
+                "Access trial migration marker stored: key=%s",
+                ACCESS_TRIAL_TEXT_UPDATE_KEY,
             )
     logger.info("Database init finished")
 

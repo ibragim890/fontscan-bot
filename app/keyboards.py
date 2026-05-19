@@ -113,7 +113,7 @@ def subscription_menu_keyboard(
                 ],
                 [
                     InlineKeyboardButton(
-                        text="⬅️ Назад",
+                        text="Назад",
                         callback_data="menu:main",
                     )
                 ],

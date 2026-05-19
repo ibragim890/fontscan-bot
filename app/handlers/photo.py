@@ -14,7 +14,7 @@ from app.access import (
     get_trial_config,
     increment_usage,
     now_utc,
-    start_trial_if_needed,
+    user_has_active_paid_plan,
     user_can_make_request,
 )
 from app.config import settings
@@ -41,7 +41,6 @@ async def photo_handler(message: Message, session: AsyncSession) -> None:
 
     user = await get_or_create_user(session, message.from_user)
     trial_config = await get_trial_config(session)
-    start_trial_if_needed(user, trial_config.days)
 
     if not user_can_make_request(user, trial_config.requests_limit):
         await message.answer(
@@ -60,6 +59,9 @@ async def photo_handler(message: Message, session: AsyncSession) -> None:
     cached_request = await find_cached_font_request(session, image_hash)
     if cached_request is not None:
         logger.info("Cache hit: %s", image_hash)
+        counted_as_usage = not user_has_active_paid_plan(user)
+        if counted_as_usage:
+            increment_usage(user, trial_config.requests_limit)
         cached_result_json = cached_request.result_json or json.dumps(
             {"cached_from": cached_request.id},
             ensure_ascii=False,
@@ -72,7 +74,7 @@ async def photo_handler(message: Message, session: AsyncSession) -> None:
                 top_font=cached_request.top_font,
                 result_json=cached_result_json,
                 status=cached_request.status,
-                counted_as_usage=False,
+                counted_as_usage=counted_as_usage,
                 is_cached_response=True,
             )
         )

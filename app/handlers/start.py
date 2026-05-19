@@ -10,7 +10,7 @@ from app.access import (
     get_or_create_user,
     get_profile_text,
     get_subscription_text,
-    user_has_current_paid_subscription,
+    user_has_active_paid_plan,
 )
 from app.keyboards import (
     back_to_menu_keyboard,
@@ -94,7 +94,7 @@ async def subscription_menu_handler(
         callback,
         await get_subscription_text(session, user),
         reply_markup=subscription_menu_keyboard(
-            user_has_current_paid_subscription(user)
+            user_has_active_paid_plan(user)
         ),
     )
     await callback.answer()

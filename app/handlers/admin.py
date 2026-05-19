@@ -7,10 +7,19 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, FSInputFile, Message
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.access import get_tariff_text_values, get_trial_config, now_utc, set_app_setting
+from app.access import (
+    get_or_create_user,
+    get_tariff_text_values,
+    get_trial_config,
+    now_utc,
+    set_app_setting,
+    user_can_make_request,
+    user_has_active_paid_plan,
+    user_has_trial_available,
+)
 from app.config import settings
 from app.db import force_rub_payment_ui_texts
 from app.keyboards import (
@@ -93,7 +102,6 @@ TEXT_KEY_TO_CATEGORY = {
 }
 
 ALL_TEXT_VARIABLES = [
-    "trial_days",
     "trial_limit",
     "status",
     "days_left",
@@ -111,7 +119,7 @@ ALL_TEXT_VARIABLES = [
 ]
 
 TEXT_VARIABLES: dict[str, list[str]] = {
-    "main_menu": ["trial_days", "trial_limit"],
+    "main_menu": ["trial_limit"],
     "find_font": [],
     "subscription_trial": [
         "days_left",
@@ -251,8 +259,6 @@ async def build_admin_stats(session: AsyncSession) -> str:
     total_users = await session.scalar(select(func.count(User.id)))
     active_trial = await session.scalar(
         select(func.count(User.id)).where(
-            User.trial_started_at.is_not(None),
-            User.trial_ends_at > now,
             User.trial_requests_used < trial_config.requests_limit,
         )
     )
@@ -317,18 +323,12 @@ async def build_secret_stats(session: AsyncSession) -> str:
     )
     active_trial = await session.scalar(
         select(func.count(User.id)).where(
-            User.trial_started_at.is_not(None),
-            User.trial_ends_at > now,
             User.trial_requests_used < trial_config.requests_limit,
         )
     )
     trial_finished = await session.scalar(
         select(func.count(User.id)).where(
-            User.trial_started_at.is_not(None),
-            or_(
-                User.trial_ends_at <= now,
-                User.trial_requests_used >= trial_config.requests_limit,
-            ),
+            User.trial_requests_used >= trial_config.requests_limit,
         )
     )
     active_designer = await session.scalar(
@@ -931,16 +931,10 @@ async def set_trial_days_handler(message: Message, session: AsyncSession) -> Non
         await message.answer("Формат: /set_trial_days <days>")
         return
 
-    days = parse_int(args[0])
-    if days is None or days <= 0 or days > 365:
-        await message.answer("Количество дней должно быть целым числом от 1 до 365.")
-        return
-
-    await set_app_setting(session, "trial_days", days)
-    logger.info("Admin %s set trial days to %s", message.from_user.id, days)
+    logger.info("Admin %s called legacy set_trial_days", message.from_user.id)
     await message.answer(
-        "Длительность Trial обновлена:\n"
-        f"{days} д."
+        "Trial теперь зависит только от количества бесплатных распознаваний. "
+        "Дни не используются."
     )
 
 
@@ -959,7 +953,7 @@ async def set_trial_limit_handler(message: Message, session: AsyncSession) -> No
         await message.answer("Лимит должен быть целым числом от 1 до 100000.")
         return
 
-    await set_app_setting(session, "trial_requests_limit", trial_limit)
+    await set_app_setting(session, "trial_limit", trial_limit)
     logger.info(
         "Admin %s set trial requests limit to %s",
         message.from_user.id,
@@ -986,7 +980,40 @@ async def tariffs_handler(message: Message, session: AsyncSession) -> None:
         for tariff in tariffs
     ]
     tariff_text = "\n\n".join(tariff_blocks) or "Тарифы не настроены."
-    await message.answer(tariff_text)
+    trial_config = await get_trial_config(session)
+    await message.answer(
+        f"Бесплатных распознаваний: {trial_config.requests_limit}\n\n"
+        f"{tariff_text}"
+    )
+
+
+@router.message(Command("debug_access"))
+async def debug_access_handler(message: Message, session: AsyncSession) -> None:
+    if not await require_tariff_admin(message, session):
+        return
+
+    user = await get_or_create_user(session, message.from_user)
+    trial_config = await get_trial_config(session)
+    has_active_paid_plan = user_has_active_paid_plan(user)
+    has_trial_available = user_has_trial_available(
+        user,
+        trial_config.requests_limit,
+    )
+    can_make_request = user_can_make_request(user, trial_config.requests_limit)
+
+    await message.answer(
+        "Access Debug\n"
+        f"telegram_id: {user.telegram_id}\n"
+        f"plan: {user.plan}\n"
+        f"plan_ends_at: {user.plan_ends_at}\n"
+        f"monthly_requests_used: {user.monthly_requests_used}\n"
+        f"monthly_requests_limit: {user.monthly_requests_limit}\n"
+        f"trial_requests_used: {user.trial_requests_used}\n"
+        f"trial_limit: {trial_config.requests_limit}\n"
+        f"has_active_paid_plan: {str(has_active_paid_plan).lower()}\n"
+        f"has_trial_available: {str(has_trial_available).lower()}\n"
+        f"can_make_request: {str(can_make_request).lower()}"
+    )
 
 
 @router.message(Command("force_rub_ui"))
@@ -1085,7 +1112,6 @@ async def reset_trials_handler(message: Message, session: AsyncSession) -> None:
             trial_started_at=None,
             trial_ends_at=None,
             trial_requests_used=0,
-            monthly_requests_used=0,
         )
     )
     count = result.rowcount or 0
