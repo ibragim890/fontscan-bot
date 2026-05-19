@@ -399,7 +399,7 @@ async def download_largest_photo(message: Message) -> bytes | None:
 
 @router.message(F.text)
 async def non_photo_handler(message: Message) -> None:
-    if message.text and message.text.lstrip().startswith("/"):
+    if message.text and message.text.startswith("/"):
         return
 
     await message.answer(NOT_PHOTO_TEXT)
