@@ -799,6 +799,7 @@ async def admin_help_handler(message: Message, session: AsyncSession) -> None:
         "/debug_payments\n"
         "/packages\n"
         "/broadcast_offer\n"
+        "/debug_broadcast_recipients\n"
         "/secret_stats"
     )
 
@@ -1194,17 +1195,79 @@ async def get_offer_broadcast_user_ids(
     session: AsyncSession,
     audience: str,
 ) -> list[int]:
-    now = now_utc()
-    query = select(User.telegram_id).order_by(User.id)
-    if audience == "free":
-        query = query.where(free_user_condition(now))
+    balance_is_empty = func.coalesce(User.recognition_balance, 0) <= 0
+    if audience == "all":
+        query = (
+            select(User)
+            .where(User.telegram_id.is_not(None))
+            .order_by(User.id)
+        )
+    elif audience == "free":
+        query = (
+            select(User)
+            .where(
+                User.telegram_id.is_not(None),
+                balance_is_empty,
+            )
+            .order_by(User.id)
+        )
     elif audience == "no_balance":
-        query = query.where(User.recognition_balance <= 0)
-    elif audience != "all":
+        query = (
+            select(User)
+            .where(
+                User.telegram_id.is_not(None),
+                balance_is_empty,
+            )
+            .order_by(User.id)
+        )
+    else:
         return []
 
     result = await session.execute(query)
-    return [telegram_id for telegram_id in result.scalars().all() if telegram_id]
+    users = result.scalars().all()
+    return [
+        user.telegram_id
+        for user in users
+        if user.telegram_id is not None
+    ]
+
+
+def first_recipient_ids_text(user_ids: list[int]) -> str:
+    first_ids = user_ids[:10]
+    if not first_ids:
+        return "нет"
+    return "\n".join(str(telegram_id) for telegram_id in first_ids)
+
+
+@router.message(Command("debug_broadcast_recipients"))
+async def debug_broadcast_recipients_handler(
+    message: Message,
+    session: AsyncSession,
+) -> None:
+    if not await require_tariff_admin(message, session):
+        return
+
+    total_users = int(await session.scalar(select(func.count(User.id))) or 0)
+    users_with_telegram_id = int(
+        await session.scalar(
+            select(func.count(User.id)).where(User.telegram_id.is_not(None))
+        )
+        or 0
+    )
+    all_user_ids = await get_offer_broadcast_user_ids(session, "all")
+    free_user_ids = await get_offer_broadcast_user_ids(session, "free")
+    no_balance_user_ids = await get_offer_broadcast_user_ids(session, "no_balance")
+
+    await message.answer(
+        "Broadcast Recipients Debug\n\n"
+        f"total users: {total_users}\n"
+        f"users with telegram_id: {users_with_telegram_id}\n"
+        f"all recipients count: {len(all_user_ids)}\n"
+        f"free recipients count: {len(free_user_ids)}\n"
+        f"no_balance recipients count: {len(no_balance_user_ids)}\n\n"
+        "Первые 10 telegram_id:\n"
+        f"{first_recipient_ids_text(all_user_ids)}"
+    )
 
 
 @router.callback_query(F.data == "broadcast_offer:cancel")
@@ -1247,7 +1310,9 @@ async def broadcast_offer_audience_callback(
     await state.set_state(BroadcastOfferState.waiting_confirm)
     await callback.message.answer(
         "Отправить offer-рассылку?\n"
-        f"Получателей: {len(user_ids)}",
+        f"Получателей: {len(user_ids)}\n\n"
+        "Первые ID:\n"
+        f"{first_recipient_ids_text(user_ids)}",
         reply_markup=broadcast_offer_confirm_keyboard(),
     )
     await callback.answer()
