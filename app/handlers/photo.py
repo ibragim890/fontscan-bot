@@ -13,6 +13,7 @@ from app.access import (
     get_or_create_user,
     get_trial_config,
     increment_usage,
+    is_useful_cached_result,
     now_utc,
     user_has_active_paid_plan,
     user_can_make_request,
@@ -27,11 +28,14 @@ from app.texts import (
     NOT_PHOTO_TEXT,
     PROCESSING_TEXT,
     TEMP_UNAVAILABLE_TEXT,
+    UNREADABLE_TEXT,
     font_result_text,
 )
 
 logger = logging.getLogger(__name__)
 router = Router(name="photo")
+
+UNREADABLE_RESULT_TYPES = {"unreadable_text", "no_text_detected", "invalid_image"}
 
 
 @router.message(F.photo)
@@ -59,9 +63,33 @@ async def photo_handler(message: Message, session: AsyncSession) -> None:
     cached_request = await find_cached_font_request(session, image_hash)
     if cached_request is not None:
         logger.info("Cache hit: %s", image_hash)
-        counted_as_usage = not user_has_active_paid_plan(user)
+        result_type = cached_result_type(cached_request)
+        provider_success = cached_provider_success(cached_request, result_type)
+        useful = is_useful_cached_result(cached_request.top_font, result_type)
+        has_active_paid_plan = user_has_active_paid_plan(user)
+        counted_as_usage = useful and not has_active_paid_plan
         if counted_as_usage:
             increment_usage(user, trial_config.requests_limit)
+            logger.info("Trial usage incremented from cache hit")
+            log_usage_incremented(
+                reason="cache_hit",
+                access_type=access_type_for_user(user),
+                provider_result_type=result_type,
+            )
+        elif useful and has_active_paid_plan:
+            logger.info("Paid cache hit skipped usage increment")
+            log_usage_skipped(
+                reason="paid_cache_hit",
+                access_type=access_type_for_user(user),
+                provider_result_type=result_type,
+            )
+        else:
+            logger.info("Cache hit not useful, usage skipped")
+            log_usage_skipped(
+                reason=usage_skip_reason(result_type, provider_success, user),
+                access_type=access_type_for_user(user),
+                provider_result_type=result_type,
+            )
         cached_result_json = cached_request.result_json or json.dumps(
             {"cached_from": cached_request.id},
             ensure_ascii=False,
@@ -74,13 +102,21 @@ async def photo_handler(message: Message, session: AsyncSession) -> None:
                 top_font=cached_request.top_font,
                 result_json=cached_result_json,
                 status=cached_request.status,
+                result_type=result_type,
+                provider_success=provider_success,
                 counted_as_usage=counted_as_usage,
                 is_cached_response=True,
             )
         )
+        await session.commit()
         await safe_edit_text(
             processing_message,
-            await font_result_text(session, cached_request.top_font),
+            await response_text_for_result(
+                session,
+                cached_request.top_font,
+                result_type,
+                provider_success,
+            ),
             reply_markup=result_actions_keyboard(),
         )
         return
@@ -109,6 +145,17 @@ async def photo_handler(message: Message, session: AsyncSession) -> None:
 
     if result.counted_as_usage:
         increment_usage(user, trial_config.requests_limit)
+        log_usage_incremented(
+            reason="provider_result",
+            access_type=access_type_for_user(user),
+            provider_result_type=result.result_type,
+        )
+    else:
+        log_usage_skipped(
+            reason=usage_skip_reason(result.result_type, result.success, user),
+            access_type=access_type_for_user(user),
+            provider_result_type=result.result_type,
+        )
 
     font_request = FontRequest(
         telegram_id=message.from_user.id,
@@ -117,6 +164,8 @@ async def photo_handler(message: Message, session: AsyncSession) -> None:
         top_font=result.title,
         result_json=json.dumps(result.result_json, ensure_ascii=False),
         status=result.status,
+        result_type=result.result_type,
+        provider_success=result.success,
         counted_as_usage=result.counted_as_usage,
         is_cached_response=False,
     )
@@ -126,14 +175,96 @@ async def photo_handler(message: Message, session: AsyncSession) -> None:
         await safe_edit_text(
             processing_message,
             result.user_message or TEMP_UNAVAILABLE_TEXT,
+            reply_markup=(
+                result_actions_keyboard()
+                if result.result_type in UNREADABLE_RESULT_TYPES
+                else None
+            ),
         )
         return
 
     await safe_edit_text(
         processing_message,
-        await font_result_text(session, result.title),
+        await response_text_for_result(
+            session,
+            result.title,
+            result.result_type,
+            result.success,
+        ),
         reply_markup=result_actions_keyboard(),
     )
+
+
+def access_type_for_user(user) -> str:
+    return "paid" if user_has_active_paid_plan(user) else "trial"
+
+
+def cached_result_type(font_request: FontRequest) -> str:
+    result_type = (font_request.result_type or "").strip()
+    if result_type and result_type != "unknown":
+        return result_type
+    if font_request.top_font:
+        return "font_found"
+    return "unreadable_text"
+
+
+def cached_provider_success(font_request: FontRequest, result_type: str) -> bool:
+    if font_request.provider_success:
+        return True
+    return is_useful_cached_result(font_request.top_font, result_type)
+
+
+def usage_skip_reason(result_type: str, provider_success: bool, user) -> str:
+    if result_type in {"unreadable_text", "invalid_image"}:
+        return "unreadable_text"
+    if result_type == "no_text_detected":
+        return "no_text_detected"
+    if result_type == "timeout":
+        return "timeout"
+    if result_type in {"provider_error", "rate_limited", "internal_api_error"}:
+        return "provider_error"
+    if provider_success and user_has_active_paid_plan(user):
+        return "paid_cache_hit"
+    return "provider_error"
+
+
+def log_usage_incremented(
+    *,
+    reason: str,
+    access_type: str,
+    provider_result_type: str,
+) -> None:
+    logger.info(
+        "usage incremented reason=%s access_type=%s provider_result_type=%s",
+        reason,
+        access_type,
+        provider_result_type,
+    )
+
+
+def log_usage_skipped(
+    *,
+    reason: str,
+    access_type: str,
+    provider_result_type: str,
+) -> None:
+    logger.info(
+        "usage skipped reason=%s access_type=%s provider_result_type=%s",
+        reason,
+        access_type,
+        provider_result_type,
+    )
+
+
+async def response_text_for_result(
+    session: AsyncSession,
+    title: str | None,
+    result_type: str,
+    provider_success: bool,
+) -> str:
+    if result_type in UNREADABLE_RESULT_TYPES or not provider_success:
+        return UNREADABLE_TEXT
+    return await font_result_text(session, title)
 
 
 async def safe_edit_text(message: Message, text: str, reply_markup=None) -> None:

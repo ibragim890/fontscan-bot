@@ -12,6 +12,16 @@ from app.payments import list_tariffs, tariff_title
 from app.texts import get_bot_text
 
 PAID_PLAN_CODES = {"designer", "studio"}
+NON_USEFUL_RESULT_TYPES = {
+    "unreadable_text",
+    "no_text_detected",
+    "provider_error",
+    "timeout",
+    "invalid_image",
+    "rate_limited",
+    "internal_api_error",
+    "invalid_response",
+}
 
 
 @dataclass(frozen=True)
@@ -219,6 +229,16 @@ def increment_usage(user: User, trial_requests_limit: int | None = None) -> None
 
     if user_has_trial_available(user, trial_requests_limit):
         user.trial_requests_used += 1
+
+
+def is_useful_cached_result(title: str | None, result_type: str | None) -> bool:
+    normalized_title = (title or "").strip().lower()
+    normalized_type = (result_type or "").strip()
+    return (
+        bool(normalized_title)
+        and normalized_title != "не определён"
+        and normalized_type not in NON_USEFUL_RESULT_TYPES
+    )
 
 
 async def get_status_text(session: AsyncSession, user: User) -> str:

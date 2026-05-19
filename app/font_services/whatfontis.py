@@ -6,13 +6,25 @@ from typing import Any, Literal
 
 import httpx
 
-from app.texts import TEMP_OVERLOADED_TEXT, TEMP_UNAVAILABLE_TEXT
+from app.texts import TEMP_OVERLOADED_TEXT, TEMP_UNAVAILABLE_TEXT, UNREADABLE_TEXT
 
 logger = logging.getLogger(__name__)
 
 WHATFONTIS_ENDPOINT = "https://www.whatfontis.com/api2/"
 
 RequestStatus = Literal["success", "no_result", "service_error"]
+ResultType = Literal[
+    "font_found",
+    "no_font_match",
+    "unreadable_text",
+    "no_text_detected",
+    "invalid_image",
+    "timeout",
+    "rate_limited",
+    "provider_error",
+    "internal_api_error",
+    "invalid_response",
+]
 
 
 @dataclass(frozen=True)
@@ -20,7 +32,9 @@ class WhatFontIsResult:
     title: str | None
     result_json: Any
     status: RequestStatus
+    success: bool
     counted_as_usage: bool
+    result_type: ResultType
     key_index: int
     api_request_made: bool
     http_status: int | None = None
@@ -64,7 +78,9 @@ class WhatFontIsClient:
                 title=None,
                 result_json={"error": "timeout"},
                 status="service_error",
+                success=False,
                 counted_as_usage=False,
+                result_type="timeout",
                 key_index=self.key_index,
                 api_request_made=True,
                 user_message=TEMP_UNAVAILABLE_TEXT,
@@ -75,7 +91,9 @@ class WhatFontIsClient:
                 title=None,
                 result_json={"error": exc.__class__.__name__},
                 status="service_error",
+                success=False,
                 counted_as_usage=False,
+                result_type="provider_error",
                 key_index=self.key_index,
                 api_request_made=True,
                 user_message=TEMP_UNAVAILABLE_TEXT,
@@ -90,7 +108,9 @@ class WhatFontIsClient:
                 title=None,
                 result_json={"status_code": 429, "error": "rate_limited"},
                 status="service_error",
+                success=False,
                 counted_as_usage=False,
+                result_type="rate_limited",
                 key_index=self.key_index,
                 api_request_made=True,
                 http_status=response.status_code,
@@ -104,7 +124,9 @@ class WhatFontIsClient:
                 title=None,
                 result_json={"status_code": response.status_code, "error": "api_key"},
                 status="service_error",
+                success=False,
                 counted_as_usage=False,
+                result_type="provider_error",
                 key_index=self.key_index,
                 api_request_made=True,
                 http_status=response.status_code,
@@ -117,7 +139,9 @@ class WhatFontIsClient:
                 title=None,
                 result_json={"status_code": response.status_code, "error": "server_error"},
                 status="service_error",
+                success=False,
                 counted_as_usage=False,
+                result_type="internal_api_error",
                 key_index=self.key_index,
                 api_request_made=True,
                 http_status=response.status_code,
@@ -127,16 +151,29 @@ class WhatFontIsClient:
         if response.status_code == HTTPStatus.OK:
             return self._parse_success_response(response)
 
-        if response.status_code == 422 or self._is_no_characters_response(lower_text):
+        if (
+            response.status_code == 422
+            or self._is_no_characters_response(lower_text)
+            or self._is_invalid_image_response(lower_text)
+        ):
             result_json = self._safe_json(response)
+            if self._is_invalid_image_response(lower_text):
+                result_type: ResultType = "invalid_image"
+            elif self._is_no_characters_response(lower_text):
+                result_type = "no_text_detected"
+            else:
+                result_type = "unreadable_text"
             return WhatFontIsResult(
                 title=None,
                 result_json=result_json,
                 status="no_result",
-                counted_as_usage=True,
+                success=False,
+                counted_as_usage=False,
+                result_type=result_type,
                 key_index=self.key_index,
                 api_request_made=True,
                 http_status=response.status_code,
+                user_message=UNREADABLE_TEXT,
             )
 
         logger.error(
@@ -151,7 +188,9 @@ class WhatFontIsClient:
                 "error": "unexpected_response",
             },
             status="service_error",
+            success=False,
             counted_as_usage=False,
+            result_type="invalid_response",
             key_index=self.key_index,
             api_request_made=True,
             http_status=response.status_code,
@@ -167,7 +206,9 @@ class WhatFontIsClient:
                 title=None,
                 result_json={"status_code": int(HTTPStatus.OK), "error": "invalid_json"},
                 status="service_error",
+                success=False,
                 counted_as_usage=False,
+                result_type="invalid_response",
                 key_index=self.key_index,
                 api_request_made=True,
                 http_status=int(HTTPStatus.OK),
@@ -182,11 +223,41 @@ class WhatFontIsClient:
                 if isinstance(raw_title, str) and raw_title.strip():
                     title = raw_title.strip()
 
+        if title is None and self._json_has_no_text_marker(result_json):
+            return WhatFontIsResult(
+                title=None,
+                result_json=result_json,
+                status="no_result",
+                success=False,
+                counted_as_usage=False,
+                result_type="no_text_detected",
+                key_index=self.key_index,
+                api_request_made=True,
+                http_status=int(HTTPStatus.OK),
+                user_message=UNREADABLE_TEXT,
+            )
+
+        if title is None and self._json_has_invalid_image_marker(result_json):
+            return WhatFontIsResult(
+                title=None,
+                result_json=result_json,
+                status="no_result",
+                success=False,
+                counted_as_usage=False,
+                result_type="invalid_image",
+                key_index=self.key_index,
+                api_request_made=True,
+                http_status=int(HTTPStatus.OK),
+                user_message=UNREADABLE_TEXT,
+            )
+
         return WhatFontIsResult(
             title=title,
             result_json=result_json,
             status="success" if title else "no_result",
+            success=True,
             counted_as_usage=True,
+            result_type="font_found" if title else "no_font_match",
             key_index=self.key_index,
             api_request_made=True,
             http_status=int(HTTPStatus.OK),
@@ -205,9 +276,26 @@ class WhatFontIsClient:
         markers = (
             "no characters",
             "no character",
+            "no text",
             "no textbox",
             "no text box",
             "text box",
             "textbox",
         )
         return any(marker in lower_text for marker in markers)
+
+    def _json_has_no_text_marker(self, value: Any) -> bool:
+        return self._is_no_characters_response(str(value).lower())
+
+    def _is_invalid_image_response(self, lower_text: str) -> bool:
+        markers = (
+            "invalid image",
+            "image invalid",
+            "bad image",
+            "not an image",
+            "unsupported image",
+        )
+        return any(marker in lower_text for marker in markers)
+
+    def _json_has_invalid_image_marker(self, value: Any) -> bool:
+        return self._is_invalid_image_response(str(value).lower())

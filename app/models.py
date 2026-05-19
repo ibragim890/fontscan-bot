@@ -146,6 +146,8 @@ class FontRequest(Base):
     top_font: Mapped[str | None] = mapped_column(String(255), nullable=True)
     result_json: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(32))
+    result_type: Mapped[str] = mapped_column(String(64), default="unknown")
+    provider_success: Mapped[bool] = mapped_column(Boolean, default=False)
     counted_as_usage: Mapped[bool] = mapped_column(Boolean, default=False)
     is_cached_response: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)

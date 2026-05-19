@@ -14,6 +14,8 @@ from app.access import (
     get_or_create_user,
     get_tariff_text_values,
     get_trial_config,
+    increment_usage,
+    is_useful_cached_result,
     now_utc,
     set_app_setting,
     user_can_make_request,
@@ -1000,6 +1002,12 @@ async def debug_access_handler(message: Message, session: AsyncSession) -> None:
         trial_config.requests_limit,
     )
     can_make_request = user_can_make_request(user, trial_config.requests_limit)
+    last_request = await session.scalar(
+        select(FontRequest)
+        .where(FontRequest.telegram_id == user.telegram_id)
+        .order_by(FontRequest.created_at.desc(), FontRequest.id.desc())
+        .limit(1)
+    )
 
     await message.answer(
         "Access Debug\n"
@@ -1012,8 +1020,89 @@ async def debug_access_handler(message: Message, session: AsyncSession) -> None:
         f"trial_limit: {trial_config.requests_limit}\n"
         f"has_active_paid_plan: {str(has_active_paid_plan).lower()}\n"
         f"has_trial_available: {str(has_trial_available).lower()}\n"
-        f"can_make_request: {str(can_make_request).lower()}"
+        f"can_make_request: {str(can_make_request).lower()}\n"
+        f"last_request_result_type: "
+        f"{last_request.result_type if last_request else 'none'}\n"
+        f"last_request_counted_as_usage: "
+        f"{str(last_request.counted_as_usage).lower() if last_request else 'none'}"
     )
+
+
+@router.message(Command("selftest_access"))
+async def selftest_access_handler(message: Message, session: AsyncSession) -> None:
+    if not await require_tariff_admin(message, session):
+        return
+
+    failures = run_access_selftest()
+    if failures:
+        await message.answer("SELFTEST FAILED:\n" + "\n".join(failures))
+        return
+
+    await message.answer("SELFTEST OK")
+
+
+def run_access_selftest() -> list[str]:
+    failures: list[str] = []
+    trial_limit = 1
+
+    user = User(telegram_id=900001, plan="none", trial_requests_used=0)
+    before = user.trial_requests_used
+    increment_usage(user, trial_limit)
+    if user.trial_requests_used != before + 1:
+        failures.append("CASE 1: success result did not increment trial usage")
+
+    user = User(telegram_id=900002, plan="none", trial_requests_used=0)
+    before = user.trial_requests_used
+    provider_result_counted_as_usage = False
+    if provider_result_counted_as_usage:
+        increment_usage(user, trial_limit)
+    if user.trial_requests_used != before:
+        failures.append("CASE 2: unreadable text incremented trial usage")
+
+    user = User(telegram_id=900003, plan="none", trial_requests_used=1)
+    api_called = False
+    if user_can_make_request(user, trial_limit):
+        api_called = True
+    if api_called:
+        failures.append("CASE 3: exhausted trial would call API")
+
+    user = User(
+        telegram_id=900004,
+        plan="designer",
+        plan_ends_at=now_utc() + timedelta(days=1),
+        monthly_requests_used=0,
+        monthly_requests_limit=10,
+    )
+    before = user.monthly_requests_used
+    cache_hit = True
+    if cache_hit and not user_has_active_paid_plan(user):
+        increment_usage(user, trial_limit)
+    if user.monthly_requests_used != before:
+        failures.append("CASE 4: paid cache hit incremented paid usage")
+
+    user = User(
+        telegram_id=900005,
+        plan="designer",
+        plan_ends_at=now_utc() - timedelta(seconds=1),
+        monthly_requests_used=0,
+        monthly_requests_limit=10,
+    )
+    api_called = False
+    if user_can_make_request(user, trial_limit):
+        api_called = True
+    if api_called:
+        failures.append("CASE 5: expired paid user would call API")
+
+    user = User(telegram_id=900006, plan="none", trial_requests_used=0)
+    before = user.trial_requests_used
+    if is_useful_cached_result("Inter", "font_found"):
+        increment_usage(user, trial_limit)
+    if user.trial_requests_used != before + 1:
+        failures.append(
+            "CASE 6: useful trial cache hit did not increment trial usage"
+        )
+
+    return failures
 
 
 @router.message(Command("force_rub_ui"))
