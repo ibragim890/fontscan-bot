@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+from datetime import timedelta
 from urllib.parse import parse_qs
 
 from aiogram import Bot, Dispatcher
@@ -10,10 +11,19 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 from sqlalchemy import select
 import uvicorn
 
-from app.access import activate_plan, now_utc
+from app.access import (
+    PACKAGE_TARIFF_CODES,
+    as_utc,
+    activate_plan,
+    get_launch_offer_hours_left,
+    grant_paid_recognitions,
+    is_launch_offer_active,
+    now_utc,
+)
 from app.config import settings
 from app.db import DbSessionMiddleware, async_session_factory, engine, init_db
 from app.handlers import admin, payments, photo, start, status, support
+from app.keyboards import offer_purchase_keyboard
 from app.models import ExternalPayment, ExternalPaymentIntent, User
 from app.payments import (
     calculate_robokassa_result_signature,
@@ -22,6 +32,7 @@ from app.payments import (
     robokassa_debug_lines,
     verify_robokassa_result_signature,
 )
+from app.texts import LAUNCH_OFFER_REMINDER_TEXT, PAYMENT_SUCCESS_TEXT
 
 
 logger = logging.getLogger(__name__)
@@ -188,10 +199,18 @@ async def robokassa_result(request: Request) -> PlainTextResponse:
                 intent.paid_at = now_utc()
 
                 try:
-                    activate_plan(user, plan.code, plan.monthly_limit)
+                    if plan.code in PACKAGE_TARIFF_CODES:
+                        grant_paid_recognitions(
+                            user,
+                            plan.code,
+                            plan.recognitions_count,
+                        )
+                    else:
+                        activate_plan(user, plan.code, plan.monthly_limit)
                 except Exception:
                     logger.exception(
-                        "Robokassa activate_plan failed: inv_id=%s user=%s tariff=%s",
+                        "Robokassa access activation failed: inv_id=%s user=%s "
+                        "tariff=%s",
                         inv_id,
                         intent.telegram_id,
                         plan.code,
@@ -202,7 +221,8 @@ async def robokassa_result(request: Request) -> PlainTextResponse:
                 await session.commit()
                 telegram_id = intent.telegram_id
                 tariff_title = plan.title
-                monthly_limit = plan.monthly_limit
+                recognitions_count = plan.recognitions_count
+                is_package_payment = plan.code in PACKAGE_TARIFF_CODES
         except Exception:
             logger.exception("Robokassa result DB processing failed")
             return PlainTextResponse("internal error")
@@ -210,14 +230,23 @@ async def robokassa_result(request: Request) -> PlainTextResponse:
         bot = getattr(request.app.state, "bot", None)
         if bot is not None:
             try:
-                await bot.send_message(
-                    telegram_id,
-                    "Оплата прошла ✅\n\n"
-                    f"Тариф: {tariff_title}\n"
-                    "Доступ активирован на 30 дней.\n"
-                    f"Распознаваний: {monthly_limit}\n\n"
-                    "Теперь отправьте фото со шрифтом.",
-                )
+                if is_package_payment:
+                    await bot.send_message(
+                        telegram_id,
+                        PAYMENT_SUCCESS_TEXT.format(
+                            recognitions_count=recognitions_count,
+                        ),
+                        parse_mode="HTML",
+                    )
+                else:
+                    await bot.send_message(
+                        telegram_id,
+                        "Оплата прошла ✅\n\n"
+                        f"Тариф: {tariff_title}\n"
+                        "Доступ активирован на 30 дней.\n"
+                        f"Распознаваний: {recognitions_count}\n\n"
+                        "Теперь отправьте фото со шрифтом.",
+                    )
             except Exception:
                 logger.exception(
                     "Failed to notify user about Robokassa payment: user=%s",
@@ -276,6 +305,104 @@ async def start_web_server() -> None:
     await server.serve()
 
 
+def due_launch_offer_reminder(user: User) -> tuple[str, int] | None:
+    if not is_launch_offer_active(user):
+        return None
+
+    now = now_utc()
+    started_at = as_utc(user.launch_offer_started_at)
+    ends_at = as_utc(user.launch_offer_ends_at)
+    if started_at is None or ends_at is None:
+        return None
+
+    due_24h = now >= ends_at - timedelta(hours=1)
+    if due_24h and not user.launch_offer_reminder_24h_sent:
+        return "24h", 1
+
+    due_18h = now >= started_at + timedelta(hours=18)
+    if due_18h and not user.launch_offer_reminder_18h_sent:
+        return "18h", get_launch_offer_hours_left(user)
+
+    due_12h = now >= started_at + timedelta(hours=12)
+    if due_12h and not user.launch_offer_reminder_12h_sent:
+        return "12h", get_launch_offer_hours_left(user)
+
+    due_6h = now >= started_at + timedelta(hours=6)
+    if due_6h and not user.launch_offer_reminder_6h_sent:
+        return "6h", get_launch_offer_hours_left(user)
+
+    return None
+
+
+def mark_launch_offer_reminder_sent(user: User, reminder: str) -> None:
+    if reminder == "6h":
+        user.launch_offer_reminder_6h_sent = True
+    elif reminder == "12h":
+        user.launch_offer_reminder_6h_sent = True
+        user.launch_offer_reminder_12h_sent = True
+    elif reminder == "18h":
+        user.launch_offer_reminder_6h_sent = True
+        user.launch_offer_reminder_12h_sent = True
+        user.launch_offer_reminder_18h_sent = True
+    elif reminder == "24h":
+        user.launch_offer_reminder_6h_sent = True
+        user.launch_offer_reminder_12h_sent = True
+        user.launch_offer_reminder_18h_sent = True
+        user.launch_offer_reminder_24h_sent = True
+
+
+async def send_launch_offer_reminders(bot: Bot) -> None:
+    while True:
+        try:
+            async with async_session_factory() as session:
+                now = now_utc()
+                result = await session.execute(
+                    select(User).where(
+                        User.launch_offer_started_at.is_not(None),
+                        User.launch_offer_ends_at.is_not(None),
+                        User.launch_offer_ends_at > now,
+                        User.launch_offer_purchased.is_(False),
+                    )
+                )
+                users = result.scalars().all()
+                for user in users:
+                    reminder = due_launch_offer_reminder(user)
+                    if reminder is None:
+                        continue
+
+                    reminder_code, hours_left = reminder
+                    try:
+                        await bot.send_message(
+                            user.telegram_id,
+                            LAUNCH_OFFER_REMINDER_TEXT.format(
+                                hours_left=hours_left,
+                            ),
+                            reply_markup=offer_purchase_keyboard(),
+                            parse_mode="HTML",
+                        )
+                        logger.info(
+                            "Launch offer reminder sent: user=%s reminder=%s",
+                            user.telegram_id,
+                            reminder_code,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to send launch offer reminder: user=%s "
+                            "reminder=%s",
+                            user.telegram_id,
+                            reminder_code,
+                        )
+
+                    mark_launch_offer_reminder_sent(user, reminder_code)
+                    await session.commit()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Launch offer reminder task iteration failed")
+
+        await asyncio.sleep(600)
+
+
 async def start_bot_polling(bot: Bot, dp: Dispatcher) -> None:
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
@@ -311,6 +438,12 @@ async def run() -> None:
         tasks = [
             asyncio.create_task(run_logged_task("polling", start_bot_polling(bot, dp))),
             asyncio.create_task(run_logged_task("uvicorn", start_web_server())),
+            asyncio.create_task(
+                run_logged_task(
+                    "launch_offer_reminders",
+                    send_launch_offer_reminders(bot),
+                )
+            ),
         ]
         await asyncio.gather(*tasks)
     finally:

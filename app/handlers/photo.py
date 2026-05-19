@@ -13,18 +13,25 @@ from app.access import (
     get_or_create_user,
     get_trial_config,
     increment_usage,
+    is_launch_offer_active,
     is_useful_cached_result,
     now_utc,
+    start_launch_offer_if_eligible,
     user_has_active_paid_plan,
     user_can_make_request,
 )
 from app.config import settings
 from app.font_services.whatfontis import WhatFontIsClient
-from app.keyboards import no_access_subscription_keyboard, result_actions_keyboard
+from app.keyboards import (
+    no_access_subscription_keyboard,
+    offer_purchase_keyboard,
+    result_actions_keyboard,
+)
 from app.models import ApiKeyUsage, FontRequest
 from app.texts import (
     DOWNLOAD_ERROR_TEXT,
     DOCUMENT_TEXT,
+    LAUNCH_OFFER_TEXT,
     NOT_PHOTO_TEXT,
     PROCESSING_TEXT,
     TEMP_UNAVAILABLE_TEXT,
@@ -44,12 +51,17 @@ async def photo_handler(message: Message, session: AsyncSession) -> None:
         return
 
     user = await get_or_create_user(session, message.from_user)
+    if user.first_photo_at is None:
+        user.first_photo_at = now_utc()
     trial_config = await get_trial_config(session)
 
     if not user_can_make_request(user, trial_config.requests_limit):
+        if user.paywall_hit_at is None:
+            user.paywall_hit_at = now_utc()
         await message.answer(
-            await get_no_access_text(session),
-            reply_markup=no_access_subscription_keyboard(),
+            await get_no_access_text(session, user),
+            reply_markup=no_access_subscription_keyboard(is_launch_offer_active(user)),
+            parse_mode="HTML",
         )
         return
 
@@ -66,28 +78,28 @@ async def photo_handler(message: Message, session: AsyncSession) -> None:
         result_type = cached_result_type(cached_request)
         provider_success = cached_provider_success(cached_request, result_type)
         useful = is_useful_cached_result(cached_request.top_font, result_type)
-        has_active_paid_plan = user_has_active_paid_plan(user)
-        counted_as_usage = useful and not has_active_paid_plan
+        counted_as_usage = useful
+        offer_started = False
+        access_type = access_type_for_user(user)
         if counted_as_usage:
+            trial_used_before = user.trial_requests_used
             increment_usage(user, trial_config.requests_limit)
-            logger.info("Trial usage incremented from cache hit")
+            if user.trial_requests_used > trial_used_before:
+                offer_started = start_launch_offer_if_eligible(
+                    user,
+                    trial_config.requests_limit,
+                )
+            logger.info("Usage incremented from cache hit")
             log_usage_incremented(
                 reason="cache_hit",
-                access_type=access_type_for_user(user),
-                provider_result_type=result_type,
-            )
-        elif useful and has_active_paid_plan:
-            logger.info("Paid cache hit skipped usage increment")
-            log_usage_skipped(
-                reason="paid_cache_hit",
-                access_type=access_type_for_user(user),
+                access_type=access_type,
                 provider_result_type=result_type,
             )
         else:
             logger.info("Cache hit not useful, usage skipped")
             log_usage_skipped(
                 reason=usage_skip_reason(result_type, provider_success, user),
-                access_type=access_type_for_user(user),
+                access_type=access_type,
                 provider_result_type=result_type,
             )
         cached_result_json = cached_request.result_json or json.dumps(
@@ -119,6 +131,8 @@ async def photo_handler(message: Message, session: AsyncSession) -> None:
             ),
             reply_markup=result_actions_keyboard(),
         )
+        if offer_started:
+            await send_launch_offer_message(message)
         return
 
     api_requests_today = await get_total_api_usage_today(session, provider="whatfontis")
@@ -143,17 +157,25 @@ async def photo_handler(message: Message, session: AsyncSession) -> None:
             rate_limited=result.rate_limited,
         )
 
+    offer_started = False
+    access_type = access_type_for_user(user)
     if result.counted_as_usage:
+        trial_used_before = user.trial_requests_used
         increment_usage(user, trial_config.requests_limit)
+        if user.trial_requests_used > trial_used_before:
+            offer_started = start_launch_offer_if_eligible(
+                user,
+                trial_config.requests_limit,
+            )
         log_usage_incremented(
             reason="provider_result",
-            access_type=access_type_for_user(user),
+            access_type=access_type,
             provider_result_type=result.result_type,
         )
     else:
         log_usage_skipped(
             reason=usage_skip_reason(result.result_type, result.success, user),
-            access_type=access_type_for_user(user),
+            access_type=access_type,
             provider_result_type=result.result_type,
         )
 
@@ -174,15 +196,22 @@ async def photo_handler(message: Message, session: AsyncSession) -> None:
     if not result.counted_as_usage:
         await safe_edit_text(
             processing_message,
-            result.user_message or TEMP_UNAVAILABLE_TEXT,
+            result.user_message
+            or await response_text_for_result(
+                session,
+                result.title,
+                result.result_type,
+                result.success,
+            ),
             reply_markup=(
                 result_actions_keyboard()
-                if result.result_type in UNREADABLE_RESULT_TYPES
+                if result.result_type in UNREADABLE_RESULT_TYPES | {"no_font_match"}
                 else None
             ),
         )
         return
 
+    await session.commit()
     await safe_edit_text(
         processing_message,
         await response_text_for_result(
@@ -193,6 +222,8 @@ async def photo_handler(message: Message, session: AsyncSession) -> None:
         ),
         reply_markup=result_actions_keyboard(),
     )
+    if offer_started:
+        await send_launch_offer_message(message)
 
 
 def access_type_for_user(user) -> str:
@@ -210,6 +241,8 @@ def cached_result_type(font_request: FontRequest) -> str:
 
 def cached_provider_success(font_request: FontRequest, result_type: str) -> bool:
     if font_request.provider_success:
+        return True
+    if result_type == "no_font_match":
         return True
     return is_useful_cached_result(font_request.top_font, result_type)
 
@@ -262,9 +295,19 @@ async def response_text_for_result(
     result_type: str,
     provider_success: bool,
 ) -> str:
+    if result_type == "no_font_match":
+        return await font_result_text(session, None)
     if result_type in UNREADABLE_RESULT_TYPES or not provider_success:
         return UNREADABLE_TEXT
     return await font_result_text(session, title)
+
+
+async def send_launch_offer_message(message: Message) -> None:
+    await message.answer(
+        LAUNCH_OFFER_TEXT,
+        reply_markup=offer_purchase_keyboard(),
+        parse_mode="HTML",
+    )
 
 
 async def safe_edit_text(message: Message, text: str, reply_markup=None) -> None:

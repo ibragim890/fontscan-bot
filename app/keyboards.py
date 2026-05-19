@@ -1,9 +1,34 @@
 import logging
+from inspect import signature
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 
 logger = logging.getLogger(__name__)
+INLINE_BUTTON_SUPPORTS_STYLE = "style" in signature(InlineKeyboardButton).parameters
+
+
+def purchase_button(
+    *,
+    text: str,
+    callback_data: str,
+    style: str | None = None,
+    fallback_text: str | None = None,
+) -> InlineKeyboardButton:
+    if style and INLINE_BUTTON_SUPPORTS_STYLE:
+        try:
+            return InlineKeyboardButton(
+                text=text,
+                callback_data=callback_data,
+                style=style,
+            )
+        except TypeError:
+            logger.warning("InlineKeyboardButton style is not supported at runtime")
+
+    return InlineKeyboardButton(
+        text=fallback_text or text,
+        callback_data=callback_data,
+    )
 
 
 def ensure_no_legacy_payment_ui(keyboard: InlineKeyboardMarkup) -> InlineKeyboardMarkup:
@@ -25,7 +50,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    text="💳 Подписка",
+                    text="💳 Доступ",
                     callback_data="menu:subscription",
                 )
             ],
@@ -63,7 +88,7 @@ def result_actions_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    text="💳 Подписка",
+                    text="💳 Доступ",
                     callback_data="menu:subscription",
                 )
             ],
@@ -76,7 +101,7 @@ def profile_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="💳 Подписка",
+                    text="💳 Доступ",
                     callback_data="menu:subscription",
                 )
             ],
@@ -92,34 +117,23 @@ def profile_keyboard() -> InlineKeyboardMarkup:
 
 def subscription_menu_keyboard(
     user_has_active_paid_plan: bool,
+    launch_offer_active: bool = False,
 ) -> InlineKeyboardMarkup:
-    if user_has_active_paid_plan:
-        return back_to_menu_keyboard()
-
-    return ensure_no_legacy_payment_ui(
-        InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="Оплатить Designer картой",
-                        callback_data="pay_card:designer",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="Оплатить Studio картой",
-                        callback_data="pay_card:studio",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="Назад",
-                        callback_data="menu:main",
-                    )
-                ],
-            ]
-        )
+    purchase_keyboard = (
+        offer_purchase_keyboard()
+        if launch_offer_active
+        else regular_purchase_keyboard()
     )
+    rows = list(purchase_keyboard.inline_keyboard)
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="Назад",
+                callback_data="menu:main",
+            )
+        ]
+    )
+    return ensure_no_legacy_payment_ui(InlineKeyboardMarkup(inline_keyboard=rows))
 
 
 def cancel_subscription_keyboard() -> InlineKeyboardMarkup:
@@ -135,8 +149,46 @@ def cancel_subscription_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def no_access_subscription_keyboard() -> InlineKeyboardMarkup:
-    return subscription_menu_keyboard(user_has_active_paid_plan=False)
+def no_access_subscription_keyboard(
+    launch_offer_active: bool = False,
+) -> InlineKeyboardMarkup:
+    return (
+        offer_purchase_keyboard()
+        if launch_offer_active
+        else regular_purchase_keyboard()
+    )
+
+
+def offer_purchase_keyboard() -> InlineKeyboardMarkup:
+    return ensure_no_legacy_payment_ui(
+        InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    purchase_button(
+                        text="Купить за 99 ₽",
+                        fallback_text="🟢 Купить за 99 ₽",
+                        callback_data="pay_card:founder_offer",
+                        style="primary",
+                    )
+                ]
+            ]
+        )
+    )
+
+
+def regular_purchase_keyboard() -> InlineKeyboardMarkup:
+    return ensure_no_legacy_payment_ui(
+        InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Купить за 199 ₽",
+                        callback_data="pay_card:founder_regular",
+                    )
+                ]
+            ]
+        )
+    )
 
 
 def invoice_link_keyboard(tariff_title: str, invoice_link: str) -> InlineKeyboardMarkup:
@@ -261,6 +313,56 @@ def text_after_save_keyboard(key: str, category: str) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="⬅️ Назад",
                     callback_data=f"text_back:{category}",
+                )
+            ],
+        ]
+    )
+
+
+def broadcast_audience_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="All",
+                    callback_data="broadcast:audience:all",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Free",
+                    callback_data="broadcast:audience:free",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Paid",
+                    callback_data="broadcast:audience:paid",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Отмена",
+                    callback_data="broadcast:cancel",
+                )
+            ],
+        ]
+    )
+
+
+def broadcast_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Отправить",
+                    callback_data="broadcast:send",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Отмена",
+                    callback_data="broadcast:cancel",
                 )
             ],
         ]

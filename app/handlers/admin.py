@@ -1,3 +1,6 @@
+import asyncio
+import csv
+import io
 import logging
 from datetime import timedelta
 from pathlib import Path
@@ -6,18 +9,24 @@ from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, FSInputFile, Message
-from sqlalchemy import func, select, update
+from aiogram.types import BufferedInputFile, CallbackQuery, FSInputFile, Message
+from sqlalchemy import and_, desc, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.access import (
+    activate_plan,
+    as_utc,
     get_or_create_user,
+    get_launch_offer_hours_left,
     get_tariff_text_values,
     get_trial_config,
     increment_usage,
+    is_launch_offer_active,
     is_useful_cached_result,
     now_utc,
+    reset_launch_offer,
     set_app_setting,
+    start_launch_offer,
     user_can_make_request,
     user_has_active_paid_plan,
     user_has_trial_available,
@@ -25,6 +34,8 @@ from app.access import (
 from app.config import settings
 from app.db import force_rub_payment_ui_texts
 from app.keyboards import (
+    broadcast_audience_keyboard,
+    broadcast_confirm_keyboard,
     subscription_menu_keyboard,
     text_after_save_keyboard,
     text_category_keyboard,
@@ -34,6 +45,7 @@ from app.keyboards import (
 from app.models import (
     AdminAccess,
     ApiKeyUsage,
+    ExternalPayment,
     FontRequest,
     Payment,
     Tariff as TariffModel,
@@ -51,10 +63,19 @@ from app.texts import (
 
 router = Router(name="admin")
 logger = logging.getLogger(__name__)
+PROCESS_STARTED_AT = now_utc()
+BROADCAST_SEND_DELAY_SECONDS = 0.08
 
 
 class TextEditState(StatesGroup):
     waiting_text = State()
+
+
+class BroadcastState(StatesGroup):
+    waiting_text = State()
+    waiting_photo = State()
+    waiting_audience = State()
+    waiting_confirm = State()
 
 
 TEXT_CATEGORIES: dict[str, tuple[str, list[tuple[str, str]]]] = {
@@ -265,10 +286,7 @@ async def build_admin_stats(session: AsyncSession) -> str:
         )
     )
     active_paid = await session.scalar(
-        select(func.count(User.id)).where(
-            User.plan.in_(["designer", "studio"]),
-            User.plan_ends_at > now,
-        )
+        select(func.count(User.id)).where(active_paid_condition(now))
     )
     total_requests = await session.scalar(select(func.count(FontRequest.id)))
     successful_payments = await session.scalar(select(func.count(Payment.id)))
@@ -345,7 +363,15 @@ async def build_secret_stats(session: AsyncSession) -> str:
             User.plan_ends_at > now,
         )
     )
-    paid_total = (active_designer or 0) + (active_studio or 0)
+    active_balance = await session.scalar(
+        select(func.count(User.id)).where(User.recognition_balance > 0)
+    )
+    paid_total = int(
+        await session.scalar(
+            select(func.count(User.id)).where(active_paid_condition(now))
+        )
+        or 0
+    )
 
     requests_today = await session.scalar(
         select(func.count(FontRequest.id)).where(FontRequest.created_at >= today_start)
@@ -395,6 +421,7 @@ async def build_secret_stats(session: AsyncSession) -> str:
         "Подписки:\n"
         f"Активных Designer: {active_designer or 0}\n"
         f"Активных Studio: {active_studio or 0}\n"
+        f"С платным балансом: {active_balance or 0}\n"
         f"Всего платных пользователей: {paid_total}\n\n"
         "Запросы:\n"
         f"Распознаваний сегодня: {requests_today or 0}\n"
@@ -411,6 +438,334 @@ async def build_secret_stats(session: AsyncSession) -> str:
         + "\n\n"
         "Safety limit:\n"
         + safety_text
+    )
+
+
+def format_percent(numerator: int, denominator: int) -> str:
+    if denominator <= 0:
+        return "0%"
+    return f"{(numerator / denominator) * 100:.1f}%"
+
+
+def active_paid_condition(now) -> object:
+    return or_(
+        User.recognition_balance > 0,
+        and_(
+            User.plan.in_(["designer", "studio"]),
+            User.plan_ends_at.is_not(None),
+            User.plan_ends_at > now,
+        ),
+    )
+
+
+def free_user_condition(now) -> object:
+    return and_(
+        User.recognition_balance <= 0,
+        or_(
+            User.plan.is_(None),
+            User.plan == "none",
+            User.plan_ends_at.is_(None),
+            User.plan_ends_at <= now,
+        ),
+    )
+
+
+async def count_paid_users_from_payments(session: AsyncSession) -> int:
+    payment_users = await session.execute(select(Payment.telegram_id))
+    external_payment_users = await session.execute(select(ExternalPayment.telegram_id))
+    paid_ids = {
+        telegram_id
+        for telegram_id in payment_users.scalars().all()
+        if telegram_id is not None
+    }
+    paid_ids.update(
+        telegram_id
+        for telegram_id in external_payment_users.scalars().all()
+        if telegram_id is not None
+    )
+    return len(paid_ids)
+
+
+async def build_funnels_text(session: AsyncSession) -> str:
+    users_started = int(await session.scalar(select(func.count(User.id))) or 0)
+    users_first_photo = int(
+        await session.scalar(
+            select(func.count(User.id)).where(User.first_photo_at.is_not(None))
+        )
+        or 0
+    )
+    users_with_requests = int(
+        await session.scalar(
+            select(func.count(func.distinct(FontRequest.telegram_id)))
+        )
+        or 0
+    )
+    users_sent_first_photo = max(users_first_photo, users_with_requests)
+    users_hit_paywall = int(
+        await session.scalar(
+            select(func.count(User.id)).where(User.paywall_hit_at.is_not(None))
+        )
+        or 0
+    )
+    users_opened_payment = int(
+        await session.scalar(
+            select(func.count(User.id)).where(User.payment_opened_at.is_not(None))
+        )
+        or 0
+    )
+    users_paid = await count_paid_users_from_payments(session)
+
+    return (
+        "Funnels\n\n"
+        f"Users started: {users_started}\n"
+        f"Users sent first photo: {users_sent_first_photo}\n"
+        f"Users hit paywall: {users_hit_paywall}\n"
+        f"Users opened payment: {users_opened_payment}\n"
+        f"Users paid: {users_paid}\n\n"
+        "Conversion:\n"
+        f"Start → Photo: {format_percent(users_sent_first_photo, users_started)}\n"
+        f"Photo → Paywall: {format_percent(users_hit_paywall, users_sent_first_photo)}\n"
+        f"Paywall → Payment: {format_percent(users_opened_payment, users_hit_paywall)}\n"
+        f"Payment → Paid: {format_percent(users_paid, users_opened_payment)}"
+    )
+
+
+async def build_top_sources_text(session: AsyncSession) -> str:
+    result = await session.execute(
+        select(User.source, func.count(User.id))
+        .where(User.source.is_not(None), User.source != "")
+        .group_by(User.source)
+        .order_by(desc(func.count(User.id)))
+        .limit(20)
+    )
+    lines = [f"{source}: {count}" for source, count in result.all()]
+    return "Top Sources\n\n" + ("\n".join(lines) if lines else "Нет данных.")
+
+
+async def build_user_stats_text(session: AsyncSession) -> str:
+    now = now_utc()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    seven_days_start = now - timedelta(days=7)
+    thirty_days_start = now - timedelta(days=30)
+    trial_config = await get_trial_config(session)
+
+    total_users = int(await session.scalar(select(func.count(User.id))) or 0)
+    today_users = int(
+        await session.scalar(
+            select(func.count(User.id)).where(User.created_at >= today_start)
+        )
+        or 0
+    )
+    seven_day_users = int(
+        await session.scalar(
+            select(func.count(User.id)).where(User.created_at >= seven_days_start)
+        )
+        or 0
+    )
+    thirty_day_users = int(
+        await session.scalar(
+            select(func.count(User.id)).where(User.created_at >= thirty_days_start)
+        )
+        or 0
+    )
+    paid_users = int(
+        await session.scalar(
+            select(func.count(User.id)).where(active_paid_condition(now))
+        )
+        or 0
+    )
+    trial_available = int(
+        await session.scalar(
+            select(func.count(User.id)).where(
+                free_user_condition(now),
+                User.trial_requests_used < trial_config.requests_limit,
+            )
+        )
+        or 0
+    )
+    trial_exhausted = int(
+        await session.scalar(
+            select(func.count(User.id)).where(
+                free_user_condition(now),
+                User.trial_requests_used >= trial_config.requests_limit,
+            )
+        )
+        or 0
+    )
+
+    return (
+        "Users\n\n"
+        f"Total: {total_users}\n"
+        f"Today: {today_users}\n"
+        f"7d: {seven_day_users}\n"
+        f"30d: {thirty_day_users}\n\n"
+        f"Paid users: {paid_users}\n"
+        f"Trial available: {trial_available}\n"
+        f"Trial exhausted: {trial_exhausted}"
+    )
+
+
+async def build_api_usage_text(session: AsyncSession) -> str:
+    today = now_utc().date()
+    usage_rows_result = await session.execute(
+        select(ApiKeyUsage).where(
+            ApiKeyUsage.provider == "whatfontis",
+            ApiKeyUsage.date == today,
+        )
+    )
+    usage_by_key = {
+        usage.key_index: usage for usage in usage_rows_result.scalars().all()
+    }
+    total_requests = sum(usage.requests_count for usage in usage_by_key.values())
+
+    lines = ["API Usage Today", ""]
+    key_count = len(settings.whatfontis_api_keys)
+    if key_count == 0:
+        lines.append("No WhatFontIs API keys configured")
+        lines.append("")
+    for index in range(1, key_count + 1):
+        usage = usage_by_key.get(index)
+        requests_count = usage.requests_count if usage else 0
+        status = "rate limited" if usage and usage.rate_limited else "active"
+        lines.extend(
+            [
+                f"Key {index}:",
+                f"requests: {requests_count}",
+                f"status: {status}",
+                "",
+            ]
+        )
+
+    safety_limit = settings.daily_api_safety_limit
+    limit_text = str(safety_limit) if safety_limit else "disabled"
+    lines.extend(
+        [
+            "Safety limit:",
+            f"{total_requests} / {limit_text}",
+        ]
+    )
+    return "\n".join(lines).strip()
+
+
+async def build_top_fonts_text(session: AsyncSession) -> str:
+    result = await session.execute(
+        select(FontRequest.top_font, func.count(FontRequest.id))
+        .where(
+            FontRequest.top_font.is_not(None),
+            FontRequest.top_font != "",
+            FontRequest.top_font != "не определён",
+        )
+        .group_by(FontRequest.top_font)
+        .order_by(desc(func.count(FontRequest.id)))
+        .limit(20)
+    )
+    lines = [f"{font_name}: {count}" for font_name, count in result.all()]
+    return "Top Fonts\n\n" + ("\n".join(lines) if lines else "Нет данных.")
+
+
+async def build_inactive_users_text(session: AsyncSession) -> str:
+    cutoff = now_utc() - timedelta(days=7)
+    total = int(
+        await session.scalar(
+            select(func.count(User.id)).where(User.updated_at < cutoff)
+        )
+        or 0
+    )
+    result = await session.execute(
+        select(User.telegram_id, User.username, User.updated_at)
+        .where(User.updated_at < cutoff)
+        .order_by(User.updated_at)
+        .limit(20)
+    )
+    rows = result.all()
+    lines = [
+        (
+            f"{telegram_id}"
+            f"{' @' + username if username else ''}"
+            f" — {updated_at}"
+        )
+        for telegram_id, username, updated_at in rows
+    ]
+    if not lines:
+        lines.append("Нет пользователей без активности 7+ дней.")
+    if total > len(rows):
+        lines.append(f"...и ещё {total - len(rows)}")
+
+    return (
+        "Inactive Users\n\n"
+        f"7+ days: {total}\n\n"
+        + "\n".join(lines)
+    )
+
+
+async def build_health_full_text(session: AsyncSession) -> str:
+    now = now_utc()
+    try:
+        await session.execute(select(func.count(User.id)).limit(1))
+        db_status = "OK"
+    except Exception as exc:
+        logger.exception("Health DB check failed: %s", exc.__class__.__name__)
+        db_status = "ERROR"
+
+    uptime = now - PROCESS_STARTED_AT
+    uptime_seconds = int(uptime.total_seconds())
+    uptime_text = (
+        f"{uptime_seconds // 86400}d "
+        f"{(uptime_seconds % 86400) // 3600}h "
+        f"{(uptime_seconds % 3600) // 60}m"
+    )
+    today = now.date()
+    key_count = len(settings.whatfontis_api_keys)
+    rate_limited_keys = int(
+        await session.scalar(
+            select(func.count(ApiKeyUsage.id)).where(
+                ApiKeyUsage.provider == "whatfontis",
+                ApiKeyUsage.date == today,
+                ApiKeyUsage.rate_limited.is_(True),
+            )
+        )
+        or 0
+    )
+    api_requests_today = int(
+        await session.scalar(
+            select(func.coalesce(func.sum(ApiKeyUsage.requests_count), 0)).where(
+                ApiKeyUsage.provider == "whatfontis",
+                ApiKeyUsage.date == today,
+            )
+        )
+        or 0
+    )
+    safety_limit = settings.daily_api_safety_limit
+    cache_total = int(
+        await session.scalar(
+            select(func.count(FontRequest.id)).where(
+                FontRequest.is_cached_response.is_(True)
+            )
+        )
+        or 0
+    )
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    cache_today = int(
+        await session.scalar(
+            select(func.count(FontRequest.id)).where(
+                FontRequest.created_at >= today_start,
+                FontRequest.is_cached_response.is_(True),
+            )
+        )
+        or 0
+    )
+
+    return (
+        "Health Full\n\n"
+        f"DB: {db_status}\n"
+        f"Railway uptime: {uptime_text}\n"
+        f"API keys: {key_count} configured, {rate_limited_keys} rate limited\n"
+        f"Safety limit: {api_requests_today} / "
+        f"{safety_limit if safety_limit else 'disabled'}\n"
+        "Polling: active\n"
+        f"Robokassa: enabled={settings.robokassa_enabled}, "
+        f"configured={settings.robokassa_is_configured}\n"
+        f"Cache: {cache_today} today, {cache_total} total"
     )
 
 
@@ -455,6 +810,405 @@ async def secret_stats_handler(message: Message, session: AsyncSession) -> None:
     await message.answer(await build_secret_stats(session))
 
 
+@router.message(Command("funnels"))
+async def funnels_handler(message: Message, session: AsyncSession) -> None:
+    if not await require_tariff_admin(message, session):
+        return
+
+    await message.answer(await build_funnels_text(session))
+
+
+@router.message(Command("top_sources"))
+async def top_sources_handler(message: Message, session: AsyncSession) -> None:
+    if not await require_tariff_admin(message, session):
+        return
+
+    await message.answer(await build_top_sources_text(session))
+
+
+@router.message(Command("user_stats"))
+async def user_stats_handler(message: Message, session: AsyncSession) -> None:
+    if not await require_tariff_admin(message, session):
+        return
+
+    await message.answer(await build_user_stats_text(session))
+
+
+@router.message(Command("api_usage"))
+async def api_usage_handler(message: Message, session: AsyncSession) -> None:
+    if not await require_tariff_admin(message, session):
+        return
+
+    await message.answer(await build_api_usage_text(session))
+
+
+@router.message(Command("top_fonts"))
+async def top_fonts_handler(message: Message, session: AsyncSession) -> None:
+    if not await require_tariff_admin(message, session):
+        return
+
+    await message.answer(await build_top_fonts_text(session))
+
+
+@router.message(Command("inactive_users"))
+async def inactive_users_handler(message: Message, session: AsyncSession) -> None:
+    if not await require_tariff_admin(message, session):
+        return
+
+    await message.answer(await build_inactive_users_text(session))
+
+
+@router.message(Command("health_full"))
+async def health_full_handler(message: Message, session: AsyncSession) -> None:
+    if not await require_tariff_admin(message, session):
+        return
+
+    await message.answer(await build_health_full_text(session))
+
+
+@router.message(Command("gift_sub"))
+async def gift_sub_handler(message: Message, session: AsyncSession) -> None:
+    if not await require_tariff_admin(message, session):
+        return
+
+    args = parse_command_args(message, 3)
+    if args is None:
+        await message.answer("Формат: /gift_sub <telegram_id> <tariff> <days>")
+        return
+
+    telegram_id = parse_int(args[0])
+    tariff_code = args[1].lower().strip()
+    days = parse_int(args[2])
+    if telegram_id is None or telegram_id <= 0:
+        await message.answer("telegram_id должен быть положительным числом.")
+        return
+    if days is None or days <= 0 or days > 3660:
+        await message.answer("days должен быть целым числом от 1 до 3660.")
+        return
+
+    plan = await find_tariff_model(session, tariff_code)
+    if plan is None or not plan.is_active:
+        await message.answer("Тариф не найден.")
+        return
+
+    user = await find_user_by_telegram_id(session, telegram_id)
+    if user is None:
+        user = User(telegram_id=telegram_id)
+        session.add(user)
+        await session.flush()
+
+    gift_base_at = now_utc()
+    current_plan_ends_at = as_utc(user.plan_ends_at)
+    if current_plan_ends_at is not None and current_plan_ends_at > gift_base_at:
+        gift_ends_at = current_plan_ends_at + timedelta(days=days)
+    else:
+        gift_ends_at = gift_base_at + timedelta(days=days)
+
+    activate_plan(
+        user,
+        plan.code,
+        plan.monthly_limit,
+        gift_ends_at,
+    )
+    logger.info(
+        "Admin %s gifted subscription user=%s tariff=%s days=%s",
+        message.from_user.id,
+        telegram_id,
+        plan.code,
+        days,
+    )
+    await message.answer("Подписка выдана.")
+
+
+@router.message(Command("export_users"))
+async def export_users_handler(message: Message, session: AsyncSession) -> None:
+    if not await require_tariff_admin(message, session):
+        return
+
+    result = await session.execute(select(User).order_by(User.id))
+    users = result.scalars().all()
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(
+        [
+            "telegram_id",
+            "username",
+            "source",
+            "created_at",
+            "plan",
+            "plan_ends_at",
+            "trial_requests_used",
+            "monthly_requests_used",
+        ]
+    )
+    for user in users:
+        writer.writerow(
+            [
+                user.telegram_id,
+                user.username or "",
+                user.source or "",
+                user.created_at.isoformat() if user.created_at else "",
+                user.plan or "",
+                user.plan_ends_at.isoformat() if user.plan_ends_at else "",
+                user.trial_requests_used,
+                user.monthly_requests_used,
+            ]
+        )
+
+    payload = buffer.getvalue().encode("utf-8-sig")
+    await message.answer_document(
+        BufferedInputFile(payload, filename="users_export.csv"),
+        caption=f"Users export: {len(users)}",
+    )
+
+
+@router.message(Command("broadcast"))
+async def broadcast_handler(
+    message: Message,
+    session: AsyncSession,
+    state: FSMContext,
+) -> None:
+    if not await require_tariff_admin(message, session):
+        return
+
+    await state.clear()
+    await state.set_state(BroadcastState.waiting_text)
+    await message.answer(
+        "Отправьте текст рассылки.\n\n"
+        "Для отмены: /cancel_broadcast"
+    )
+
+
+@router.message(Command("broadcast_photo"))
+async def broadcast_photo_handler(
+    message: Message,
+    session: AsyncSession,
+    state: FSMContext,
+) -> None:
+    if not await require_tariff_admin(message, session):
+        return
+
+    await state.clear()
+    await state.set_state(BroadcastState.waiting_photo)
+    await message.answer(
+        "Отправьте фото для рассылки. Caption будет использован как текст.\n\n"
+        "Для отмены: /cancel_broadcast"
+    )
+
+
+@router.message(Command("cancel_broadcast"))
+async def cancel_broadcast_handler(message: Message, state: FSMContext) -> None:
+    if (await state.get_state() or "").startswith("BroadcastState:"):
+        await state.clear()
+        await message.answer("Рассылка отменена.")
+        return
+
+    await message.answer("Нет активной рассылки.")
+
+
+async def show_broadcast_audience_step(message: Message, state: FSMContext) -> None:
+    await state.set_state(BroadcastState.waiting_audience)
+    await message.answer(
+        "Аудитория:",
+        reply_markup=broadcast_audience_keyboard(),
+    )
+
+
+@router.message(BroadcastState.waiting_text, F.text, ~F.text.startswith("/"))
+async def broadcast_text_received_handler(
+    message: Message,
+    session: AsyncSession,
+    state: FSMContext,
+) -> None:
+    if not await require_tariff_admin(message, session):
+        await state.clear()
+        return
+
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("Отправьте непустой текст рассылки.")
+        return
+
+    await state.update_data(kind="text", text=text)
+    await message.answer("Preview:")
+    await message.answer(text)
+    await show_broadcast_audience_step(message, state)
+
+
+@router.message(BroadcastState.waiting_text, F.photo)
+@router.message(BroadcastState.waiting_text, F.document)
+async def broadcast_text_expected_handler(message: Message) -> None:
+    await message.answer("Отправьте текст рассылки или /cancel_broadcast.")
+
+
+@router.message(BroadcastState.waiting_photo, F.photo)
+async def broadcast_photo_received_handler(
+    message: Message,
+    session: AsyncSession,
+    state: FSMContext,
+) -> None:
+    if not await require_tariff_admin(message, session):
+        await state.clear()
+        return
+
+    if message.caption and message.caption.lstrip().startswith("/"):
+        return
+
+    photo = message.photo[-1]
+    caption = message.caption or ""
+    await state.update_data(
+        kind="photo",
+        photo_file_id=photo.file_id,
+        caption=caption,
+    )
+    await message.answer("Preview:")
+    await message.answer_photo(photo.file_id, caption=caption or None)
+    await show_broadcast_audience_step(message, state)
+
+
+@router.message(BroadcastState.waiting_photo, F.text, ~F.text.startswith("/"))
+async def broadcast_photo_expected_handler(message: Message) -> None:
+    await message.answer("Отправьте фото для рассылки или /cancel_broadcast.")
+
+
+def audience_title(audience: str) -> str:
+    titles = {
+        "all": "all",
+        "free": "free",
+        "paid": "paid",
+    }
+    return titles.get(audience, audience)
+
+
+async def get_broadcast_user_ids(
+    session: AsyncSession,
+    audience: str,
+) -> list[int]:
+    now = now_utc()
+    query = select(User.telegram_id).order_by(User.id)
+    if audience == "free":
+        query = query.where(free_user_condition(now))
+    elif audience == "paid":
+        query = query.where(active_paid_condition(now))
+    elif audience != "all":
+        return []
+
+    result = await session.execute(query)
+    return [telegram_id for telegram_id in result.scalars().all() if telegram_id]
+
+
+@router.callback_query(
+    BroadcastState.waiting_audience,
+    F.data.startswith("broadcast:audience:"),
+)
+async def broadcast_audience_callback(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    state: FSMContext,
+) -> None:
+    if not await require_text_admin_callback(callback, session):
+        await state.clear()
+        return
+
+    audience = callback.data.rsplit(":", maxsplit=1)[1]
+    user_ids = await get_broadcast_user_ids(session, audience)
+    await state.update_data(audience=audience)
+    await state.set_state(BroadcastState.waiting_confirm)
+    await callback.message.answer(
+        "Confirm\n\n"
+        f"Audience: {audience_title(audience)}\n"
+        f"Users: {len(user_ids)}",
+        reply_markup=broadcast_confirm_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "broadcast:cancel")
+async def broadcast_cancel_callback(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    state: FSMContext,
+) -> None:
+    if not await require_text_admin_callback(callback, session):
+        await state.clear()
+        return
+
+    await state.clear()
+    await callback.message.answer("Рассылка отменена.")
+    await callback.answer()
+
+
+@router.callback_query(BroadcastState.waiting_confirm, F.data == "broadcast:send")
+async def broadcast_send_callback(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    state: FSMContext,
+) -> None:
+    if not await require_text_admin_callback(callback, session):
+        await state.clear()
+        return
+
+    data = await state.get_data()
+    audience = data.get("audience")
+    if not isinstance(audience, str):
+        await state.clear()
+        await callback.message.answer("Аудитория не выбрана. Рассылка отменена.")
+        await callback.answer()
+        return
+
+    user_ids = await get_broadcast_user_ids(session, audience)
+    await callback.message.answer(
+        "Рассылка запущена.\n"
+        f"Аудитория: {audience_title(audience)}\n"
+        f"Получателей: {len(user_ids)}"
+    )
+    await callback.answer()
+
+    sent = 0
+    failed = 0
+    kind = data.get("kind")
+    for telegram_id in user_ids:
+        try:
+            if kind == "photo":
+                photo_file_id = data.get("photo_file_id")
+                if not isinstance(photo_file_id, str) or not photo_file_id:
+                    raise ValueError("Missing broadcast photo file_id")
+                caption = data.get("caption")
+                await callback.bot.send_photo(
+                    telegram_id,
+                    photo_file_id,
+                    caption=caption if isinstance(caption, str) and caption else None,
+                )
+            else:
+                text = data.get("text")
+                if not isinstance(text, str) or not text:
+                    raise ValueError("Missing broadcast text")
+                await callback.bot.send_message(telegram_id, text)
+            sent += 1
+        except Exception as exc:
+            failed += 1
+            logger.exception(
+                "Broadcast delivery failed: admin=%s user=%s error=%s",
+                callback.from_user.id,
+                telegram_id,
+                exc.__class__.__name__,
+            )
+        await asyncio.sleep(BROADCAST_SEND_DELAY_SECONDS)
+
+    await state.clear()
+    logger.info(
+        "Broadcast finished: admin=%s audience=%s sent=%s failed=%s",
+        callback.from_user.id,
+        audience,
+        sent,
+        failed,
+    )
+    await callback.message.answer(
+        f"Sent: {sent}\n"
+        f"Failed: {failed}"
+    )
+
+
 @router.message(Command("admin_logout"))
 async def admin_logout_handler(message: Message, session: AsyncSession) -> None:
     access = await get_admin_access(session, message.from_user.id)
@@ -478,6 +1232,17 @@ def parse_int(value: str) -> int | None:
         return int(value)
     except ValueError:
         return None
+
+
+def parse_telegram_id_arg(message: Message) -> int | None:
+    args = parse_command_args(message, 1)
+    if args is None:
+        return None
+
+    telegram_id = parse_int(args[0])
+    if telegram_id is None or telegram_id <= 0:
+        return None
+    return telegram_id
 
 
 async def require_tariff_admin(message: Message, session: AsyncSession) -> bool:
@@ -815,7 +1580,7 @@ async def cancel_text_handler(message: Message, state: FSMContext) -> None:
     await message.answer("Нет активного редактирования.")
 
 
-@router.message(TextEditState.waiting_text)
+@router.message(TextEditState.waiting_text, F.text, ~F.text.startswith("/"))
 async def save_waiting_text_handler(
     message: Message,
     session: AsyncSession,
@@ -845,6 +1610,12 @@ async def save_waiting_text_handler(
     )
 
 
+@router.message(TextEditState.waiting_text, F.photo)
+@router.message(TextEditState.waiting_text, F.document)
+async def text_edit_text_expected_handler(message: Message) -> None:
+    await message.answer("Отправьте текстовое сообщение или /cancel_text.")
+
+
 async def find_tariff_model(
     session: AsyncSession,
     code: str,
@@ -853,6 +1624,49 @@ async def find_tariff_model(
         select(TariffModel).where(TariffModel.code == code.lower().strip())
     )
     return result.scalar_one_or_none()
+
+
+async def find_user_by_telegram_id(
+    session: AsyncSession,
+    telegram_id: int,
+) -> User | None:
+    result = await session.execute(
+        select(User).where(User.telegram_id == telegram_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def build_user_access_debug_text(
+    session: AsyncSession,
+    user: User,
+) -> str:
+    trial_config = await get_trial_config(session)
+    has_active_paid_plan = user_has_active_paid_plan(user)
+    has_trial_available = user_has_trial_available(
+        user,
+        trial_config.requests_limit,
+    )
+    can_make_request = user_can_make_request(user, trial_config.requests_limit)
+
+    return (
+        "Access Debug\n"
+        f"telegram_id: {user.telegram_id}\n"
+        f"plan: {user.plan}\n"
+        f"plan_ends_at: {user.plan_ends_at}\n"
+        f"monthly_requests_used: {user.monthly_requests_used}\n"
+        f"monthly_requests_limit: {user.monthly_requests_limit}\n"
+        f"recognition_balance: {user.recognition_balance}\n"
+        f"trial_requests_used: {user.trial_requests_used}\n"
+        f"trial_limit: {trial_config.requests_limit}\n"
+        f"launch_offer_started_at: {user.launch_offer_started_at}\n"
+        f"launch_offer_ends_at: {user.launch_offer_ends_at}\n"
+        f"launch_offer_purchased: {str(user.launch_offer_purchased).lower()}\n"
+        f"launch_offer_active: {str(is_launch_offer_active(user)).lower()}\n"
+        f"launch_offer_hours_left: {get_launch_offer_hours_left(user)}\n"
+        f"has_active_paid_plan: {str(has_active_paid_plan).lower()}\n"
+        f"has_trial_available: {str(has_trial_available).lower()}\n"
+        f"can_make_request: {str(can_make_request).lower()}"
+    )
 
 
 @router.message(Command("set_price"))
@@ -989,19 +1803,57 @@ async def tariffs_handler(message: Message, session: AsyncSession) -> None:
     )
 
 
+@router.message(Command("packages"))
+async def packages_handler(message: Message, session: AsyncSession) -> None:
+    await tariffs_handler(message, session)
+
+
+@router.message(Command("debug_offer"))
+async def debug_offer_handler(message: Message, session: AsyncSession) -> None:
+    if not await require_tariff_admin(message, session):
+        return
+
+    user = await get_or_create_user(session, message.from_user)
+    await message.answer(
+        "Offer Debug\n"
+        f"launch_offer_started_at: {user.launch_offer_started_at}\n"
+        f"launch_offer_ends_at: {user.launch_offer_ends_at}\n"
+        f"launch_offer_purchased: {str(user.launch_offer_purchased).lower()}\n"
+        f"reminder_6h: {str(user.launch_offer_reminder_6h_sent).lower()}\n"
+        f"reminder_12h: {str(user.launch_offer_reminder_12h_sent).lower()}\n"
+        f"reminder_18h: {str(user.launch_offer_reminder_18h_sent).lower()}\n"
+        f"reminder_24h: {str(user.launch_offer_reminder_24h_sent).lower()}\n"
+        f"offer_active: {str(is_launch_offer_active(user)).lower()}\n"
+        f"hours_left: {get_launch_offer_hours_left(user)}"
+    )
+
+
+@router.message(Command("reset_my_offer"))
+async def reset_my_offer_handler(message: Message, session: AsyncSession) -> None:
+    if not await require_tariff_admin(message, session):
+        return
+
+    user = await get_or_create_user(session, message.from_user)
+    reset_launch_offer(user)
+    await message.answer("Offer текущего админа сброшен.")
+
+
+@router.message(Command("start_my_offer"))
+async def start_my_offer_handler(message: Message, session: AsyncSession) -> None:
+    if not await require_tariff_admin(message, session):
+        return
+
+    user = await get_or_create_user(session, message.from_user)
+    start_launch_offer(user)
+    await message.answer("Offer текущего админа запущен на 24 часа.")
+
+
 @router.message(Command("debug_access"))
 async def debug_access_handler(message: Message, session: AsyncSession) -> None:
     if not await require_tariff_admin(message, session):
         return
 
     user = await get_or_create_user(session, message.from_user)
-    trial_config = await get_trial_config(session)
-    has_active_paid_plan = user_has_active_paid_plan(user)
-    has_trial_available = user_has_trial_available(
-        user,
-        trial_config.requests_limit,
-    )
-    can_make_request = user_can_make_request(user, trial_config.requests_limit)
     last_request = await session.scalar(
         select(FontRequest)
         .where(FontRequest.telegram_id == user.telegram_id)
@@ -1010,22 +1862,31 @@ async def debug_access_handler(message: Message, session: AsyncSession) -> None:
     )
 
     await message.answer(
-        "Access Debug\n"
-        f"telegram_id: {user.telegram_id}\n"
-        f"plan: {user.plan}\n"
-        f"plan_ends_at: {user.plan_ends_at}\n"
-        f"monthly_requests_used: {user.monthly_requests_used}\n"
-        f"monthly_requests_limit: {user.monthly_requests_limit}\n"
-        f"trial_requests_used: {user.trial_requests_used}\n"
-        f"trial_limit: {trial_config.requests_limit}\n"
-        f"has_active_paid_plan: {str(has_active_paid_plan).lower()}\n"
-        f"has_trial_available: {str(has_trial_available).lower()}\n"
-        f"can_make_request: {str(can_make_request).lower()}\n"
+        await build_user_access_debug_text(session, user)
+        + "\n"
         f"last_request_result_type: "
         f"{last_request.result_type if last_request else 'none'}\n"
         f"last_request_counted_as_usage: "
         f"{str(last_request.counted_as_usage).lower() if last_request else 'none'}"
     )
+
+
+@router.message(Command("debug_user_access"))
+async def debug_user_access_handler(message: Message, session: AsyncSession) -> None:
+    if not await require_tariff_admin(message, session):
+        return
+
+    telegram_id = parse_telegram_id_arg(message)
+    if telegram_id is None:
+        await message.answer("Формат: /debug_user_access <telegram_id>")
+        return
+
+    user = await find_user_by_telegram_id(session, telegram_id)
+    if user is None:
+        await message.answer("Пользователь не найден.")
+        return
+
+    await message.answer(await build_user_access_debug_text(session, user))
 
 
 @router.message(Command("selftest_access"))
@@ -1075,10 +1936,10 @@ def run_access_selftest() -> list[str]:
     )
     before = user.monthly_requests_used
     cache_hit = True
-    if cache_hit and not user_has_active_paid_plan(user):
+    if cache_hit and is_useful_cached_result("Inter", "font_found"):
         increment_usage(user, trial_limit)
-    if user.monthly_requests_used != before:
-        failures.append("CASE 4: paid cache hit incremented paid usage")
+    if user.monthly_requests_used != before + 1:
+        failures.append("CASE 4: useful paid cache hit did not increment paid usage")
 
     user = User(
         telegram_id=900005,
@@ -1086,6 +1947,7 @@ def run_access_selftest() -> list[str]:
         plan_ends_at=now_utc() - timedelta(seconds=1),
         monthly_requests_used=0,
         monthly_requests_limit=10,
+        trial_requests_used=trial_limit,
     )
     api_called = False
     if user_can_make_request(user, trial_limit):
@@ -1101,6 +1963,24 @@ def run_access_selftest() -> list[str]:
         failures.append(
             "CASE 6: useful trial cache hit did not increment trial usage"
         )
+
+    user = User(
+        telegram_id=900007,
+        plan="none",
+        trial_requests_used=trial_limit,
+        recognition_balance=3,
+    )
+    before = user.recognition_balance
+    increment_usage(user, trial_limit)
+    if user.recognition_balance != before - 1:
+        failures.append("CASE 7: paid balance did not decrement")
+
+    user = User(telegram_id=900008, plan="none", trial_requests_used=0)
+    before = user.trial_requests_used
+    if is_useful_cached_result(None, "no_font_match"):
+        increment_usage(user, trial_limit)
+    if user.trial_requests_used != before:
+        failures.append("CASE 8: no_font_match incremented trial usage")
 
     return failures
 
@@ -1188,6 +2068,57 @@ async def reset_limits_handler(message: Message, session: AsyncSession) -> None:
         "Лимиты сброшены.\n\n"
         f"Пользователей обновлено: {count}"
     )
+
+
+@router.message(Command("reset_user_trial"))
+async def reset_user_trial_handler(message: Message, session: AsyncSession) -> None:
+    if not await require_tariff_admin(message, session):
+        return
+
+    telegram_id = parse_telegram_id_arg(message)
+    if telegram_id is None:
+        await message.answer("Формат: /reset_user_trial <telegram_id>")
+        return
+
+    user = await find_user_by_telegram_id(session, telegram_id)
+    if user is None:
+        await message.answer("Пользователь не найден.")
+        return
+
+    user.trial_requests_used = 0
+    user.trial_started_at = None
+    user.trial_ends_at = None
+    logger.info(
+        "Admin %s reset trial for user %s",
+        message.from_user.id,
+        telegram_id,
+    )
+    await message.answer(f"Trial пользователя {telegram_id} сброшен.")
+
+
+@router.message(Command("reset_user_limits"))
+async def reset_user_limits_handler(message: Message, session: AsyncSession) -> None:
+    if not await require_tariff_admin(message, session):
+        return
+
+    telegram_id = parse_telegram_id_arg(message)
+    if telegram_id is None:
+        await message.answer("Формат: /reset_user_limits <telegram_id>")
+        return
+
+    user = await find_user_by_telegram_id(session, telegram_id)
+    if user is None:
+        await message.answer("Пользователь не найден.")
+        return
+
+    user.trial_requests_used = 0
+    user.monthly_requests_used = 0
+    logger.info(
+        "Admin %s reset limits for user %s",
+        message.from_user.id,
+        telegram_id,
+    )
+    await message.answer(f"Лимиты пользователя {telegram_id} сброшены.")
 
 
 @router.message(Command("reset_trials"))

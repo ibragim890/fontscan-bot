@@ -17,6 +17,8 @@ class User(Base):
     telegram_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
     username: Mapped[str | None] = mapped_column(String(255), nullable=True)
     first_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    source: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    referred_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -33,6 +35,7 @@ class User(Base):
         nullable=True,
     )
     trial_requests_used: Mapped[int] = mapped_column(Integer, default=0)
+    recognition_balance: Mapped[int] = mapped_column(Integer, default=0)
 
     plan: Mapped[str] = mapped_column(String(32), default="none")
     plan_started_at: Mapped[datetime | None] = mapped_column(
@@ -45,6 +48,18 @@ class User(Base):
     )
     monthly_requests_used: Mapped[int] = mapped_column(Integer, default=0)
     monthly_requests_limit: Mapped[int] = mapped_column(Integer, default=0)
+    first_photo_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    paywall_hit_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    payment_opened_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
 
     subscription_payment_charge_id: Mapped[str | None] = mapped_column(
         String(255),
@@ -52,6 +67,19 @@ class User(Base):
     )
     subscription_payload: Mapped[str | None] = mapped_column(String(255), nullable=True)
     subscription_canceled: Mapped[bool] = mapped_column(Boolean, default=False)
+    launch_offer_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    launch_offer_ends_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    launch_offer_purchased: Mapped[bool] = mapped_column(Boolean, default=False)
+    launch_offer_reminder_6h_sent: Mapped[bool] = mapped_column(Boolean, default=False)
+    launch_offer_reminder_12h_sent: Mapped[bool] = mapped_column(Boolean, default=False)
+    launch_offer_reminder_18h_sent: Mapped[bool] = mapped_column(Boolean, default=False)
+    launch_offer_reminder_24h_sent: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class PaymentIntent(Base):

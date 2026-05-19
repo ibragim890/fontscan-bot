@@ -123,6 +123,60 @@ async def init_db() -> None:
                 )
             )
 
+        user_columns = await conn.execute(text("PRAGMA table_info(users)"))
+        user_column_names = {row[1] for row in user_columns.fetchall()}
+        user_columns_to_add = {
+            "source": "VARCHAR(255)",
+            "referred_by": "VARCHAR(255)",
+            "first_photo_at": "DATETIME",
+            "paywall_hit_at": "DATETIME",
+            "payment_opened_at": "DATETIME",
+            "recognition_balance": "INTEGER DEFAULT 0 NOT NULL",
+            "launch_offer_started_at": "DATETIME",
+            "launch_offer_ends_at": "DATETIME",
+            "launch_offer_purchased": "BOOLEAN DEFAULT 0 NOT NULL",
+            "launch_offer_reminder_6h_sent": "BOOLEAN DEFAULT 0 NOT NULL",
+            "launch_offer_reminder_12h_sent": "BOOLEAN DEFAULT 0 NOT NULL",
+            "launch_offer_reminder_18h_sent": "BOOLEAN DEFAULT 0 NOT NULL",
+            "launch_offer_reminder_24h_sent": "BOOLEAN DEFAULT 0 NOT NULL",
+        }
+        for column_name, column_type in user_columns_to_add.items():
+            if column_name not in user_column_names:
+                await conn.execute(
+                    text(f"ALTER TABLE users ADD COLUMN {column_name} {column_type}")
+                )
+
+        await conn.execute(
+            text(
+                "UPDATE users "
+                "SET first_photo_at = ("
+                "SELECT MIN(font_requests.created_at) "
+                "FROM font_requests "
+                "WHERE font_requests.telegram_id = users.telegram_id"
+                ") "
+                "WHERE first_photo_at IS NULL "
+                "AND EXISTS ("
+                "SELECT 1 FROM font_requests "
+                "WHERE font_requests.telegram_id = users.telegram_id"
+                ")"
+            )
+        )
+        await conn.execute(
+            text(
+                "UPDATE users "
+                "SET payment_opened_at = ("
+                "SELECT MIN(external_payment_intents.created_at) "
+                "FROM external_payment_intents "
+                "WHERE external_payment_intents.telegram_id = users.telegram_id"
+                ") "
+                "WHERE payment_opened_at IS NULL "
+                "AND EXISTS ("
+                "SELECT 1 FROM external_payment_intents "
+                "WHERE external_payment_intents.telegram_id = users.telegram_id"
+                ")"
+            )
+        )
+
         now = datetime.now(timezone.utc)
         default_tariffs = [
             (
@@ -156,6 +210,48 @@ async def init_db() -> None:
                     "price_stars": price_stars,
                     "monthly_limit": monthly_limit,
                     "created_at": now,
+                    "updated_at": now,
+                },
+            )
+
+        package_tariffs = [
+            ("founder_offer", "Founder offer", 99, 50),
+            ("founder_regular", "Founder regular", 199, 50),
+        ]
+        for code, title, price_rub, recognitions_count in package_tariffs:
+            await conn.execute(
+                text(
+                    "INSERT INTO tariffs "
+                    "(code, title, price_stars, monthly_limit, is_active, "
+                    "created_at, updated_at) "
+                    "SELECT :code, :title, :price_rub, :recognitions_count, 1, "
+                    ":created_at, :updated_at "
+                    "WHERE NOT EXISTS ("
+                    "SELECT 1 FROM tariffs WHERE code = :code"
+                    ")"
+                ),
+                {
+                    "code": code,
+                    "title": title,
+                    "price_rub": price_rub,
+                    "recognitions_count": recognitions_count,
+                    "created_at": now,
+                    "updated_at": now,
+                },
+            )
+            await conn.execute(
+                text(
+                    "UPDATE tariffs "
+                    "SET title = :title, price_stars = :price_rub, "
+                    "monthly_limit = :recognitions_count, is_active = 1, "
+                    "updated_at = :updated_at "
+                    "WHERE code = :code"
+                ),
+                {
+                    "code": code,
+                    "title": title,
+                    "price_rub": price_rub,
+                    "recognitions_count": recognitions_count,
                     "updated_at": now,
                 },
             )

@@ -12,9 +12,14 @@ from app.payments import list_tariffs, tariff_title
 from app.texts import get_bot_text
 
 PAID_PLAN_CODES = {"designer", "studio"}
+FOUNDER_OFFER_CODE = "founder_offer"
+FOUNDER_REGULAR_CODE = "founder_regular"
+PACKAGE_TARIFF_CODES = {FOUNDER_OFFER_CODE, FOUNDER_REGULAR_CODE}
+LAUNCH_OFFER_DURATION = timedelta(hours=24)
 NON_USEFUL_RESULT_TYPES = {
     "unreadable_text",
     "no_text_detected",
+    "service_error",
     "provider_error",
     "timeout",
     "invalid_image",
@@ -79,6 +84,66 @@ def duration_parts_until(value: datetime | None) -> tuple[int, int]:
     return total_hours // 24, total_hours % 24
 
 
+def is_launch_offer_active(user: User) -> bool:
+    started_at = as_utc(user.launch_offer_started_at)
+    ends_at = as_utc(user.launch_offer_ends_at)
+    return (
+        started_at is not None
+        and ends_at is not None
+        and ends_at > now_utc()
+        and not user.launch_offer_purchased
+    )
+
+
+def get_launch_offer_hours_left(user: User) -> int:
+    if not is_launch_offer_active(user):
+        return 0
+
+    ends_at = as_utc(user.launch_offer_ends_at)
+    if ends_at is None:
+        return 0
+
+    seconds_left = (ends_at - now_utc()).total_seconds()
+    if seconds_left <= 0:
+        return 0
+    return max(1, ceil(seconds_left / 3600))
+
+
+def reset_launch_offer(user: User) -> None:
+    user.launch_offer_started_at = None
+    user.launch_offer_ends_at = None
+    user.launch_offer_purchased = False
+    user.launch_offer_reminder_6h_sent = False
+    user.launch_offer_reminder_12h_sent = False
+    user.launch_offer_reminder_18h_sent = False
+    user.launch_offer_reminder_24h_sent = False
+
+
+def start_launch_offer(user: User, started_at: datetime | None = None) -> None:
+    start = started_at or now_utc()
+    user.launch_offer_started_at = start
+    user.launch_offer_ends_at = start + LAUNCH_OFFER_DURATION
+    user.launch_offer_purchased = False
+    user.launch_offer_reminder_6h_sent = False
+    user.launch_offer_reminder_12h_sent = False
+    user.launch_offer_reminder_18h_sent = False
+    user.launch_offer_reminder_24h_sent = False
+
+
+def start_launch_offer_if_eligible(user: User, free_limit: int) -> bool:
+    if free_limit <= 0:
+        return False
+    if user.launch_offer_started_at is not None:
+        return False
+    if user.launch_offer_purchased:
+        return False
+    if user.trial_requests_used != free_limit:
+        return False
+
+    start_launch_offer(user)
+    return True
+
+
 def days_left_until(value: datetime | None) -> int:
     normalized = as_utc(value)
     if normalized is None:
@@ -99,12 +164,18 @@ def remaining_trial_requests_for_limit(user: User, requests_limit: int) -> int:
 
 
 def remaining_paid_requests(user: User) -> int:
-    return max(0, user.monthly_requests_limit - user.monthly_requests_used)
+    legacy_remaining = max(0, user.monthly_requests_limit - user.monthly_requests_used)
+    return paid_recognition_balance(user) + legacy_remaining
+
+
+def paid_recognition_balance(user: User) -> int:
+    return max(0, int(user.recognition_balance or 0))
 
 
 async def get_or_create_user(
     session: AsyncSession,
     telegram_user: TelegramUser,
+    start_payload: str | None = None,
 ) -> User:
     result = await session.execute(
         select(User).where(User.telegram_id == telegram_user.id)
@@ -116,13 +187,39 @@ async def get_or_create_user(
             username=telegram_user.username,
             first_name=telegram_user.first_name,
         )
+        apply_start_payload(user, start_payload)
         session.add(user)
         await session.flush()
         return user
 
     user.username = telegram_user.username
     user.first_name = telegram_user.first_name
+    apply_start_payload(user, start_payload)
     return user
+
+
+def normalize_start_payload(payload: str | None) -> str | None:
+    if payload is None:
+        return None
+
+    normalized = payload.strip()
+    if not normalized:
+        return None
+
+    return normalized[:255]
+
+
+def apply_start_payload(user: User, payload: str | None) -> None:
+    normalized = normalize_start_payload(payload)
+    if normalized is None:
+        return
+
+    if not user.source:
+        user.source = normalized
+
+    if normalized.startswith("ref_") and not user.referred_by:
+        referral = normalized.removeprefix("ref_").strip()
+        user.referred_by = (referral or normalized)[:255]
 
 
 async def get_app_setting_int(
@@ -175,7 +272,7 @@ def start_trial_if_needed(user: User, trial_days: int | None = None) -> None:
     return None
 
 
-def user_has_active_paid_plan(user: User) -> bool:
+def user_has_active_legacy_paid_plan(user: User) -> bool:
     plan_ends_at = as_utc(user.plan_ends_at)
     return (
         user.plan in PAID_PLAN_CODES
@@ -183,6 +280,10 @@ def user_has_active_paid_plan(user: User) -> bool:
         and plan_ends_at > now_utc()
         and user.monthly_requests_used < user.monthly_requests_limit
     )
+
+
+def user_has_active_paid_plan(user: User) -> bool:
+    return paid_recognition_balance(user) > 0 or user_has_active_legacy_paid_plan(user)
 
 
 def user_has_current_paid_subscription(user: User) -> bool:
@@ -223,12 +324,25 @@ def user_can_make_request(user: User, trial_requests_limit: int | None = None) -
 
 
 def increment_usage(user: User, trial_requests_limit: int | None = None) -> None:
-    if user_has_active_paid_plan(user):
+    if paid_recognition_balance(user) > 0:
+        user.recognition_balance -= 1
+        return
+
+    if user_has_active_legacy_paid_plan(user):
         user.monthly_requests_used += 1
         return
 
     if user_has_trial_available(user, trial_requests_limit):
         user.trial_requests_used += 1
+
+
+def grant_paid_recognitions(user: User, tariff: str, recognitions_count: int) -> None:
+    if recognitions_count <= 0:
+        raise ValueError("recognitions_count must be positive")
+
+    user.recognition_balance = paid_recognition_balance(user) + recognitions_count
+    if tariff in PACKAGE_TARIFF_CODES:
+        user.launch_offer_purchased = True
 
 
 def is_useful_cached_result(title: str | None, result_type: str | None) -> bool:
@@ -270,19 +384,53 @@ async def get_main_menu_text(session: AsyncSession) -> str:
     )
 
 
-async def get_no_access_text(session: AsyncSession) -> str:
-    base_text = await get_bot_text(
-        session,
-        "no_access",
-        **(await get_tariff_text_values(session)),
+async def get_access_text(session: AsyncSession, user: User) -> str:
+    trial_config = await get_trial_config(session)
+    free_remaining = remaining_trial_requests_for_limit(
+        user,
+        trial_config.requests_limit,
     )
-    text = append_rub_tariff_block(
-        strip_payment_tariff_lines(base_text),
-        await get_tariff_text_values(session),
-        include_month=True,
-        terminal_period=False,
+    paid_balance = paid_recognition_balance(user)
+
+    if is_launch_offer_active(user):
+        return (
+            "<b>Доступ Fontopus 🐙</b>\n\n"
+            f"Бесплатные распознавания: <b>{free_remaining} / "
+            f"{trial_config.requests_limit}</b>\n"
+            f"Платный баланс: <b>{paid_balance}</b>\n\n"
+            "Спец-доступ для первых пользователей:\n\n"
+            "<b>50 распознаваний за 99 ₽</b>\n"
+            "<s>199 ₽</s>\n\n"
+            f"Осталось: <b>{get_launch_offer_hours_left(user)} ч.</b>"
+        )
+
+    return (
+        "<b>Доступ Fontopus 🐙</b>\n\n"
+        f"Бесплатные распознавания: <b>{free_remaining} / "
+        f"{trial_config.requests_limit}</b>\n"
+        f"Платный баланс: <b>{paid_balance}</b>\n\n"
+        "Пакет:\n"
+        "<b>50 распознаваний за 199 ₽</b>"
     )
-    return with_card_payment_unavailable_notice(text)
+
+
+async def get_no_access_text(session: AsyncSession, user: User) -> str:
+    if is_launch_offer_active(user):
+        return (
+            "<b>Бесплатное распознавание использовано 🐙</b>\n\n"
+            "Можно забрать спец-доступ:\n\n"
+            "<b>50 распознаваний за 99 ₽</b>\n"
+            "<s>199 ₽</s>\n\n"
+            f"Осталось: <b>{get_launch_offer_hours_left(user)} ч.</b>\n\n"
+            "1 распознавание = 1 найденный шрифт."
+        )
+
+    return (
+        "<b>Бесплатное распознавание использовано 🐙</b>\n\n"
+        "Можно купить пакет:\n\n"
+        "<b>50 распознаваний за 199 ₽</b>\n\n"
+        "1 распознавание = 1 найденный шрифт."
+    )
 
 
 def strip_payment_tariff_lines(text: str) -> str:
@@ -350,23 +498,12 @@ async def get_profile_text(
     user: User,
     include_title: bool = True,
 ) -> str:
-    trial_config = await get_trial_config(session)
+    if not user_has_current_paid_subscription(user):
+        return await get_access_text(session, user)
 
-    if user_has_current_paid_subscription(user):
-        title = await tariff_title(session, user.plan)
-        text_key = f"profile_{user.plan}"
-        if user.subscription_canceled:
-            return await get_bot_text(
-                session,
-                text_key,
-                status=f"{title} ✅",
-                tariff=title,
-                date=format_date(user.plan_ends_at),
-                days_left=days_left_until(user.plan_ends_at),
-                remaining=remaining_paid_requests(user),
-                limit=user.monthly_requests_limit,
-            )
-
+    title = await tariff_title(session, user.plan)
+    text_key = f"profile_{user.plan}"
+    if user.subscription_canceled:
         return await get_bot_text(
             session,
             text_key,
@@ -378,74 +515,20 @@ async def get_profile_text(
             limit=user.monthly_requests_limit,
         )
 
-    if user_has_trial_available(user, trial_config.requests_limit):
-        return await get_bot_text(
-            session,
-            "profile_trial" if include_title else "profile_trial",
-            status="Бесплатный доступ",
-            days_left=0,
-            hours_left=0,
-            remaining=remaining_trial_requests_for_limit(
-                user,
-                trial_config.requests_limit,
-            ),
-            limit=trial_config.requests_limit,
-        )
-
-    return await get_bot_text(session, "profile_no_access", status="Нет активной подписки")
+    return await get_bot_text(
+        session,
+        text_key,
+        status=f"{title} ✅",
+        tariff=title,
+        date=format_date(user.plan_ends_at),
+        days_left=days_left_until(user.plan_ends_at),
+        remaining=remaining_paid_requests(user),
+        limit=user.monthly_requests_limit,
+    )
 
 
 async def get_subscription_text(session: AsyncSession, user: User) -> str:
-    trial_config = await get_trial_config(session)
-
-    if user_has_current_paid_subscription(user):
-        title = await tariff_title(session, user.plan)
-        return await get_bot_text(
-            session,
-            f"subscription_{user.plan}",
-            status=f"{title} ✅",
-            tariff=title,
-            date=format_date(user.plan_ends_at),
-            days_left=days_left_until(user.plan_ends_at),
-            remaining=remaining_paid_requests(user),
-            limit=user.monthly_requests_limit,
-        )
-
-    if user_has_trial_available(user, trial_config.requests_limit):
-        tariff_values = await get_tariff_text_values(session)
-        base_text = await get_bot_text(
-            session,
-            "subscription_trial",
-            status="Бесплатный доступ",
-            days_left=0,
-            hours_left=0,
-            remaining=remaining_trial_requests_for_limit(
-                user,
-                trial_config.requests_limit,
-            ),
-            limit=trial_config.requests_limit,
-            **tariff_values,
-        )
-        text = append_rub_tariff_block(
-            strip_payment_tariff_lines(base_text),
-            tariff_values,
-            include_month=True,
-        )
-        return with_card_payment_unavailable_notice(text)
-
-    tariff_values = await get_tariff_text_values(session)
-    base_text = await get_bot_text(
-        session,
-        "subscription_no_access",
-        status="Нет активного доступа",
-        **tariff_values,
-    )
-    text = append_rub_tariff_block(
-        strip_payment_tariff_lines(base_text),
-        tariff_values,
-        include_month=True,
-    )
-    return with_card_payment_unavailable_notice(text)
+    return await get_access_text(session, user)
 
 
 def normalize_subscription_expiration(value: object) -> datetime | None:

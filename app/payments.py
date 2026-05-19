@@ -40,6 +40,14 @@ class TariffPlan:
     def key(self) -> str:
         return self.code
 
+    @property
+    def price_rub(self) -> int:
+        return self.price_stars
+
+    @property
+    def recognitions_count(self) -> int:
+        return self.monthly_limit
+
 
 @dataclass(frozen=True)
 class InvoiceDeliveryResult:
@@ -98,12 +106,17 @@ def ensure_send_invoice_subscription_period_support() -> None:
 
 
 def tariff_from_model(tariff: TariffModel) -> TariffPlan:
+    description = (
+        f"{tariff.monthly_limit} распознаваний"
+        if tariff.code in {"founder_offer", "founder_regular"}
+        else f"{tariff.monthly_limit} распознаваний шрифтов в месяц"
+    )
     return TariffPlan(
         code=tariff.code,
         title=tariff.title,
         price_stars=tariff.price_stars,
         monthly_limit=tariff.monthly_limit,
-        description=f"{tariff.monthly_limit} распознаваний шрифтов в месяц",
+        description=description,
     )
 
 
@@ -273,7 +286,7 @@ def make_robokassa_payment_url(
         "MerchantLogin": settings.robokassa_merchant_login.strip(),
         "OutSum": out_sum,
         "InvId": inv_id,
-        "Description": f"Подписка {tariff_title} на 30 дней",
+        "Description": f"{tariff_title}: распознавания шрифтов",
         "SignatureValue": signature_value,
         "Culture": "ru",
         "Encoding": "utf-8",
@@ -626,7 +639,7 @@ async def save_successful_payment(
     user: User,
     successful_payment: object,
 ) -> tuple[Payment, PaymentIntent]:
-    from app.access import activate_plan
+    from app.access import PACKAGE_TARIFF_CODES, activate_plan, grant_paid_recognitions
 
     intent = await find_intent_by_payload(
         session,
@@ -649,12 +662,13 @@ async def save_successful_payment(
     )
     if existing is not None:
         intent.status = "paid"
-        activate_plan(
-            user,
-            intent.tariff,
-            plan.monthly_limit,
-            existing.subscription_expiration_date,
-        )
+        if intent.tariff not in PACKAGE_TARIFF_CODES:
+            activate_plan(
+                user,
+                intent.tariff,
+                plan.monthly_limit,
+                existing.subscription_expiration_date,
+            )
         user.subscription_payment_charge_id = existing.telegram_payment_charge_id
         user.subscription_payload = existing.invoice_payload
         return existing, intent
@@ -677,12 +691,15 @@ async def save_successful_payment(
     )
     session.add(payment)
     intent.status = "paid"
-    activate_plan(
-        user,
-        intent.tariff,
-        plan.monthly_limit,
-        payment.subscription_expiration_date,
-    )
+    if intent.tariff in PACKAGE_TARIFF_CODES:
+        grant_paid_recognitions(user, intent.tariff, plan.recognitions_count)
+    else:
+        activate_plan(
+            user,
+            intent.tariff,
+            plan.monthly_limit,
+            payment.subscription_expiration_date,
+        )
     user.subscription_payment_charge_id = payment.telegram_payment_charge_id
     user.subscription_payload = payment.invoice_payload
     await session.flush()

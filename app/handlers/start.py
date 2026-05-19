@@ -10,6 +10,7 @@ from app.access import (
     get_or_create_user,
     get_profile_text,
     get_subscription_text,
+    is_launch_offer_active,
     user_has_active_paid_plan,
 )
 from app.keyboards import (
@@ -28,17 +29,28 @@ async def edit_or_answer(
     callback: CallbackQuery,
     text: str,
     reply_markup=None,
+    parse_mode: str | None = None,
 ) -> None:
     try:
-        await callback.message.edit_text(text, reply_markup=reply_markup)
+        await callback.message.edit_text(
+            text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode,
+        )
     except Exception as exc:
         logger.debug("Failed to edit menu message: %s", exc.__class__.__name__)
-        await callback.message.answer(text, reply_markup=reply_markup)
+        await callback.message.answer(
+            text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode,
+        )
 
 
 @router.message(CommandStart())
 async def start_handler(message: Message, session: AsyncSession) -> None:
-    await get_or_create_user(session, message.from_user)
+    command_parts = (message.text or "").split(maxsplit=1)
+    start_payload = command_parts[1] if len(command_parts) == 2 else None
+    await get_or_create_user(session, message.from_user, start_payload=start_payload)
     await message.answer(
         await get_main_menu_text(session),
         reply_markup=main_menu_keyboard(),
@@ -94,8 +106,10 @@ async def subscription_menu_handler(
         callback,
         await get_subscription_text(session, user),
         reply_markup=subscription_menu_keyboard(
-            user_has_active_paid_plan(user)
+            user_has_active_paid_plan(user),
+            is_launch_offer_active(user),
         ),
+        parse_mode="HTML",
     )
     await callback.answer()
 
@@ -110,5 +124,6 @@ async def profile_menu_handler(
         callback,
         await get_profile_text(session, user),
         reply_markup=profile_keyboard(),
+        parse_mode="HTML",
     )
     await callback.answer()

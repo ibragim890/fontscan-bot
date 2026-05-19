@@ -251,13 +251,16 @@ class WhatFontIsClient:
                 user_message=UNREADABLE_TEXT,
             )
 
+        normalized_title = (title or "").strip().lower()
+        useful_title = bool(normalized_title and normalized_title != "не определён")
+
         return WhatFontIsResult(
-            title=title,
+            title=title if useful_title else None,
             result_json=result_json,
-            status="success" if title else "no_result",
-            success=True,
-            counted_as_usage=True,
-            result_type="font_found" if title else "no_font_match",
+            status="success" if useful_title else "no_result",
+            success=useful_title,
+            counted_as_usage=useful_title,
+            result_type="font_found" if useful_title else "no_font_match",
             key_index=self.key_index,
             api_request_made=True,
             http_status=int(HTTPStatus.OK),

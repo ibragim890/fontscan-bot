@@ -8,9 +8,13 @@ from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.access import (
+    FOUNDER_OFFER_CODE,
+    PACKAGE_TARIFF_CODES,
     format_date,
     get_or_create_user,
     get_subscription_text,
+    is_launch_offer_active,
+    now_utc,
     user_has_active_paid_plan,
     user_has_current_paid_subscription,
 )
@@ -19,6 +23,7 @@ from app.keyboards import (
     cancel_subscription_keyboard,
     invoice_link_keyboard,
     main_menu_keyboard,
+    regular_purchase_keyboard,
     subscription_menu_keyboard,
 )
 from app.payments import (
@@ -33,7 +38,12 @@ from app.payments import (
 )
 from app.config import settings
 from app.models import Payment, PaymentIntent
-from app.texts import NO_ACTIVE_SUBSCRIPTION_TEXT, get_bot_text
+from app.texts import (
+    NO_ACTIVE_SUBSCRIPTION_TEXT,
+    OFFER_EXPIRED_TEXT,
+    PAYMENT_SUCCESS_TEXT,
+    get_bot_text,
+)
 
 logger = logging.getLogger(__name__)
 router = Router(name="payments")
@@ -45,8 +55,10 @@ async def subscribe_handler(message: Message, session: AsyncSession) -> None:
     await message.answer(
         await get_subscription_text(session, user),
         reply_markup=subscription_menu_keyboard(
-            user_has_active_paid_plan(user)
+            user_has_active_paid_plan(user),
+            is_launch_offer_active(user),
         ),
+        parse_mode="HTML",
     )
 
 
@@ -102,14 +114,24 @@ async def card_payment_callback(
     session: AsyncSession,
 ) -> None:
     user = await get_or_create_user(session, callback.from_user)
-    if user_has_active_paid_plan(user):
+    tariff = callback.data.split(":", maxsplit=1)[1]
+
+    if tariff == FOUNDER_OFFER_CODE and not is_launch_offer_active(user):
+        await callback.message.answer(
+            OFFER_EXPIRED_TEXT,
+            reply_markup=regular_purchase_keyboard(),
+            parse_mode="HTML",
+        )
+        await callback.answer()
+        return
+
+    if tariff not in PACKAGE_TARIFF_CODES and user_has_active_paid_plan(user):
         await callback.answer(
             "У вас уже есть активная подписка.",
             show_alert=True,
         )
         return
 
-    tariff = callback.data.split(":", maxsplit=1)[1]
     plan = await get_tariff(session, tariff)
     if plan is None:
         await callback.answer("Тариф не найден.", show_alert=True)
@@ -121,6 +143,7 @@ async def card_payment_callback(
             callback.from_user.id,
             plan.code,
         )
+        user.payment_opened_at = now_utc()
         await session.commit()
     except RobokassaPaymentUnavailableError:
         await callback.answer(
@@ -131,11 +154,11 @@ async def card_payment_callback(
 
     await callback.message.answer(
         "Оплата картой\n\n"
-        f"Тариф: {plan.title}\n"
-        "Срок доступа: 30 дней\n"
-        f"Распознаваний: {plan.monthly_limit}\n\n"
-        "После оплаты подписка активируется автоматически.",
+        f"Пакет: {plan.recognitions_count} распознаваний\n"
+        f"Сумма: {plan.price_rub} ₽\n\n"
+        "После оплаты распознавания начислятся автоматически.",
         reply_markup=card_payment_keyboard(invoice_url),
+        parse_mode="HTML",
     )
     await callback.answer()
 
@@ -188,6 +211,16 @@ async def successful_payment_handler(message: Message, session: AsyncSession) ->
             payment.amount_stars,
             payment.telegram_payment_charge_id,
         )
+        if intent.tariff in PACKAGE_TARIFF_CODES:
+            await message.answer(
+                PAYMENT_SUCCESS_TEXT.format(
+                    recognitions_count=plan.recognitions_count,
+                ),
+                reply_markup=main_menu_keyboard(),
+                parse_mode="HTML",
+            )
+            return
+
         await message.answer(
             await get_bot_text(
                 session,
