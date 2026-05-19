@@ -4,7 +4,7 @@ import logging
 from typing import Any
 
 from aiogram import BaseMiddleware
-from sqlalchemy import inspect, text
+from sqlalchemy import inspect, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
@@ -142,6 +142,211 @@ async def force_rub_payment_ui_texts(db: Any) -> None:
         )
 
 
+async def seed_default_data(dialect: str) -> None:
+    from app.models import AppSetting, BotText, RecognitionPackage, Tariff
+    from app.texts import (
+        ACCESS_TRIAL_TEXT_UPDATE_KEY,
+        DEFAULT_BOT_TEXTS,
+        FORCED_TEXT_UPDATE_KEY,
+        FORCED_TEXT_UPDATE_KEYS,
+        USAGE_RESULT_TEXT_UPDATE_KEY,
+        USAGE_RESULT_TEXT_UPDATE_KEYS,
+    )
+
+    now = datetime.now(timezone.utc)
+    async with async_session_factory() as session:
+        default_tariffs = [
+            (
+                "designer",
+                "Designer",
+                settings.designer_price_stars,
+                settings.designer_monthly_limit,
+            ),
+            (
+                "studio",
+                "Studio",
+                settings.studio_price_stars,
+                settings.studio_monthly_limit,
+            ),
+        ]
+        for code, title, price_stars, monthly_limit in default_tariffs:
+            result = await session.execute(select(Tariff).where(Tariff.code == code))
+            tariff = result.scalar_one_or_none()
+            if tariff is None:
+                session.add(
+                    Tariff(
+                        code=code,
+                        title=title,
+                        price_stars=price_stars,
+                        monthly_limit=monthly_limit,
+                        is_active=True,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+
+        package_tariffs = [
+            ("founder_offer", "Founder offer", 99, 50),
+            ("founder_regular", "Founder regular", 199, 50),
+        ]
+        for code, title, price_rub, recognitions_count in package_tariffs:
+            result = await session.execute(select(Tariff).where(Tariff.code == code))
+            tariff = result.scalar_one_or_none()
+            if tariff is None:
+                session.add(
+                    Tariff(
+                        code=code,
+                        title=title,
+                        price_stars=price_rub,
+                        monthly_limit=recognitions_count,
+                        is_active=True,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+            else:
+                tariff.title = title
+                tariff.price_stars = price_rub
+                tariff.monthly_limit = recognitions_count
+                tariff.is_active = True
+                tariff.updated_at = now
+
+            package_result = await session.execute(
+                select(RecognitionPackage).where(RecognitionPackage.code == code)
+            )
+            package = package_result.scalar_one_or_none()
+            if package is None:
+                session.add(
+                    RecognitionPackage(
+                        code=code,
+                        title=title,
+                        price_rub=price_rub,
+                        recognitions_count=recognitions_count,
+                        is_active=True,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+            else:
+                package.title = title
+                package.price_rub = price_rub
+                package.recognitions_count = recognitions_count
+                package.is_active = True
+                package.updated_at = now
+
+        default_settings = [
+            ("trial_limit", "1"),
+        ]
+        for key, value in default_settings:
+            result = await session.execute(
+                select(AppSetting).where(AppSetting.key == key)
+            )
+            setting = result.scalar_one_or_none()
+            if setting is None:
+                session.add(AppSetting(key=key, value=value, updated_at=now))
+
+        forced_update_result = await session.execute(
+            select(AppSetting).where(AppSetting.key == FORCED_TEXT_UPDATE_KEY)
+        )
+        should_force_text_update = forced_update_result.scalar_one_or_none() is None
+        access_trial_update_result = await session.execute(
+            select(AppSetting).where(AppSetting.key == ACCESS_TRIAL_TEXT_UPDATE_KEY)
+        )
+        should_force_access_trial_update = (
+            access_trial_update_result.scalar_one_or_none() is None
+        )
+        usage_result_update_result = await session.execute(
+            select(AppSetting).where(AppSetting.key == USAGE_RESULT_TEXT_UPDATE_KEY)
+        )
+        should_force_usage_result_update = (
+            usage_result_update_result.scalar_one_or_none() is None
+        )
+        logger.info(
+            "Bot text migration check: key=%s should_force_update=%s",
+            FORCED_TEXT_UPDATE_KEY,
+            should_force_text_update,
+        )
+        logger.info(
+            "Access trial migration check: key=%s should_force_update=%s",
+            ACCESS_TRIAL_TEXT_UPDATE_KEY,
+            should_force_access_trial_update,
+        )
+        logger.info(
+            "Usage result migration check: key=%s should_force_update=%s",
+            USAGE_RESULT_TEXT_UPDATE_KEY,
+            should_force_usage_result_update,
+        )
+
+        for key, (title, text_value) in DEFAULT_BOT_TEXTS.items():
+            result = await session.execute(select(BotText).where(BotText.key == key))
+            bot_text = result.scalar_one_or_none()
+            if bot_text is None:
+                bot_text = BotText(
+                    key=key,
+                    title=title,
+                    text=text_value,
+                    created_at=now,
+                    updated_at=now,
+                )
+                session.add(bot_text)
+
+            should_update_text = (
+                should_force_text_update and key in FORCED_TEXT_UPDATE_KEYS
+            ) or (
+                should_force_access_trial_update and key in FORCED_TEXT_UPDATE_KEYS
+            ) or (
+                should_force_usage_result_update
+                and key in USAGE_RESULT_TEXT_UPDATE_KEYS
+            )
+            if should_update_text:
+                bot_text.title = title
+                bot_text.text = text_value
+                bot_text.updated_at = now
+
+        await session.flush()
+
+        if should_force_text_update:
+            await force_rub_payment_ui_texts(session)
+            session.add(
+                AppSetting(
+                    key=FORCED_TEXT_UPDATE_KEY,
+                    value="1",
+                    updated_at=now,
+                )
+            )
+            logger.info(
+                "Bot text migration marker stored: key=%s",
+                FORCED_TEXT_UPDATE_KEY,
+            )
+        if should_force_access_trial_update:
+            session.add(
+                AppSetting(
+                    key=ACCESS_TRIAL_TEXT_UPDATE_KEY,
+                    value="1",
+                    updated_at=now,
+                )
+            )
+            logger.info(
+                "Access trial migration marker stored: key=%s",
+                ACCESS_TRIAL_TEXT_UPDATE_KEY,
+            )
+        if should_force_usage_result_update:
+            session.add(
+                AppSetting(
+                    key=USAGE_RESULT_TEXT_UPDATE_KEY,
+                    value="1",
+                    updated_at=now,
+                )
+            )
+            logger.info(
+                "Usage result migration marker stored: key=%s",
+                USAGE_RESULT_TEXT_UPDATE_KEY,
+            )
+
+        await session.commit()
+        logger.info("Database default data seeded: dialect=%s", dialect)
+
+
 async def init_db() -> None:
     import app.models  # noqa: F401
 
@@ -256,242 +461,8 @@ async def init_db() -> None:
             )
         )
 
-        now = datetime.now(timezone.utc)
-        default_tariffs = [
-            (
-                "designer",
-                "Designer",
-                settings.designer_price_stars,
-                settings.designer_monthly_limit,
-            ),
-            (
-                "studio",
-                "Studio",
-                settings.studio_price_stars,
-                settings.studio_monthly_limit,
-            ),
-        ]
-        for code, title, price_stars, monthly_limit in default_tariffs:
-            await conn.execute(
-                text(
-                    "INSERT INTO tariffs "
-                    "(code, title, price_stars, monthly_limit, is_active, "
-                    "created_at, updated_at) "
-                    "SELECT :code, :title, :price_stars, :monthly_limit, :is_active, "
-                    ":created_at, :updated_at "
-                    "WHERE NOT EXISTS ("
-                    "SELECT 1 FROM tariffs WHERE code = :code"
-                    ")"
-                ),
-                {
-                    "code": code,
-                    "title": title,
-                    "price_stars": price_stars,
-                    "monthly_limit": monthly_limit,
-                    "is_active": True,
-                    "created_at": now,
-                    "updated_at": now,
-                },
-            )
-
-        package_tariffs = [
-            ("founder_offer", "Founder offer", 99, 50),
-            ("founder_regular", "Founder regular", 199, 50),
-        ]
-        for code, title, price_rub, recognitions_count in package_tariffs:
-            await conn.execute(
-                text(
-                    "INSERT INTO tariffs "
-                    "(code, title, price_stars, monthly_limit, is_active, "
-                    "created_at, updated_at) "
-                    "SELECT :code, :title, :price_rub, :recognitions_count, "
-                    ":is_active, "
-                    ":created_at, :updated_at "
-                    "WHERE NOT EXISTS ("
-                    "SELECT 1 FROM tariffs WHERE code = :code"
-                    ")"
-                ),
-                {
-                    "code": code,
-                    "title": title,
-                    "price_rub": price_rub,
-                    "recognitions_count": recognitions_count,
-                    "is_active": True,
-                    "created_at": now,
-                    "updated_at": now,
-                },
-            )
-            await conn.execute(
-                text(
-                    "UPDATE tariffs "
-                    "SET title = :title, price_stars = :price_rub, "
-                    "monthly_limit = :recognitions_count, "
-                    "is_active = :is_active, "
-                    "updated_at = :updated_at "
-                    "WHERE code = :code"
-                ),
-                {
-                    "code": code,
-                    "title": title,
-                    "price_rub": price_rub,
-                    "recognitions_count": recognitions_count,
-                    "is_active": True,
-                    "updated_at": now,
-                },
-            )
-
-        default_settings = [
-            ("trial_limit", "1"),
-        ]
-        for key, value in default_settings:
-            await conn.execute(
-                text(
-                    "INSERT INTO app_settings (key, value, updated_at) "
-                    "SELECT :key, :value, :updated_at "
-                    "WHERE NOT EXISTS ("
-                    "SELECT 1 FROM app_settings WHERE key = :key"
-                    ")"
-                ),
-                {"key": key, "value": value, "updated_at": now},
-            )
-
-        from app.texts import (
-            ACCESS_TRIAL_TEXT_UPDATE_KEY,
-            DEFAULT_BOT_TEXTS,
-            FORCED_TEXT_UPDATE_KEY,
-            FORCED_TEXT_UPDATE_KEYS,
-            USAGE_RESULT_TEXT_UPDATE_KEY,
-            USAGE_RESULT_TEXT_UPDATE_KEYS,
-        )
-
-        forced_update_exists = await conn.execute(
-            text("SELECT 1 FROM app_settings WHERE key = :key"),
-            {"key": FORCED_TEXT_UPDATE_KEY},
-        )
-        should_force_text_update = forced_update_exists.first() is None
-        access_trial_update_exists = await conn.execute(
-            text("SELECT 1 FROM app_settings WHERE key = :key"),
-            {"key": ACCESS_TRIAL_TEXT_UPDATE_KEY},
-        )
-        should_force_access_trial_update = access_trial_update_exists.first() is None
-        usage_result_update_exists = await conn.execute(
-            text("SELECT 1 FROM app_settings WHERE key = :key"),
-            {"key": USAGE_RESULT_TEXT_UPDATE_KEY},
-        )
-        should_force_usage_result_update = usage_result_update_exists.first() is None
-        logger.info(
-            "Bot text migration check: key=%s should_force_update=%s",
-            FORCED_TEXT_UPDATE_KEY,
-            should_force_text_update,
-        )
-        logger.info(
-            "Access trial migration check: key=%s should_force_update=%s",
-            ACCESS_TRIAL_TEXT_UPDATE_KEY,
-            should_force_access_trial_update,
-        )
-        logger.info(
-            "Usage result migration check: key=%s should_force_update=%s",
-            USAGE_RESULT_TEXT_UPDATE_KEY,
-            should_force_usage_result_update,
-        )
-
-        for key, (title, text_value) in DEFAULT_BOT_TEXTS.items():
-            await conn.execute(
-                text(
-                    "INSERT INTO bot_texts "
-                    "(key, title, text, created_at, updated_at) "
-                    "SELECT :key, :title, :text, :created_at, :updated_at "
-                    "WHERE NOT EXISTS ("
-                    "SELECT 1 FROM bot_texts WHERE key = :key"
-                    ")"
-                ),
-                {
-                    "key": key,
-                    "title": title,
-                    "text": text_value,
-                    "created_at": now,
-                    "updated_at": now,
-                },
-            )
-            should_update_text = (
-                should_force_text_update and key in FORCED_TEXT_UPDATE_KEYS
-            ) or (
-                should_force_access_trial_update and key in FORCED_TEXT_UPDATE_KEYS
-            ) or (
-                should_force_usage_result_update
-                and key in USAGE_RESULT_TEXT_UPDATE_KEYS
-            )
-            if should_update_text:
-                result = await conn.execute(
-                    text(
-                        "UPDATE bot_texts "
-                        "SET title = :title, text = :new_text, updated_at = :updated_at "
-                        "WHERE key = :key"
-                    ),
-                    {
-                        "key": key,
-                        "title": title,
-                        "new_text": text_value,
-                        "updated_at": now,
-                    },
-                )
-                logger.info(
-                    "Bot text forced update: key=%s rows=%s",
-                    key,
-                    result.rowcount,
-                )
-
-        if should_force_text_update:
-            await force_rub_payment_ui_texts(conn)
-
-            await conn.execute(
-                text(
-                    "INSERT INTO app_settings (key, value, updated_at) "
-                    "VALUES (:key, :value, :updated_at)"
-                ),
-                {
-                    "key": FORCED_TEXT_UPDATE_KEY,
-                    "value": "1",
-                    "updated_at": now,
-                },
-            )
-            logger.info(
-                "Bot text migration marker stored: key=%s",
-                FORCED_TEXT_UPDATE_KEY,
-            )
-        if should_force_access_trial_update:
-            await conn.execute(
-                text(
-                    "INSERT INTO app_settings (key, value, updated_at) "
-                    "VALUES (:key, :value, :updated_at)"
-                ),
-                {
-                    "key": ACCESS_TRIAL_TEXT_UPDATE_KEY,
-                    "value": "1",
-                    "updated_at": now,
-                },
-            )
-            logger.info(
-                "Access trial migration marker stored: key=%s",
-                ACCESS_TRIAL_TEXT_UPDATE_KEY,
-            )
-        if should_force_usage_result_update:
-            await conn.execute(
-                text(
-                    "INSERT INTO app_settings (key, value, updated_at) "
-                    "VALUES (:key, :value, :updated_at)"
-                ),
-                {
-                    "key": USAGE_RESULT_TEXT_UPDATE_KEY,
-                    "value": "1",
-                    "updated_at": now,
-                },
-            )
-            logger.info(
-                "Usage result migration marker stored: key=%s",
-                USAGE_RESULT_TEXT_UPDATE_KEY,
-            )
-    logger.info("Database init finished")
+    await seed_default_data(dialect)
+    logger.info("Database init finished: dialect=%s", dialect)
 
 
 class DbSessionMiddleware(BaseMiddleware):
