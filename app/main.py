@@ -22,7 +22,7 @@ from app.access import (
 )
 from app.config import settings
 from app.db import DbSessionMiddleware, async_session_factory, engine, init_db
-from app.handlers import admin, payments, photo, start, status, support
+from app.handlers import admin, offer_admin, payments, photo, start, status, support
 from app.keyboards import offer_purchase_keyboard
 from app.models import ExternalPayment, ExternalPaymentIntent, User
 from app.payments import (
@@ -284,6 +284,9 @@ def build_dispatcher() -> Dispatcher:
     dp.callback_query.middleware(db_middleware)
     dp.pre_checkout_query.middleware(db_middleware)
 
+    logger.info("Including offer_admin router FIRST")
+    dp.include_router(offer_admin.router)
+    logger.info("Including admin router")
     dp.include_router(admin.router)
     dp.include_router(start.router)
     dp.include_router(status.router)

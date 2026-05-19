@@ -24,9 +24,7 @@ from app.access import (
     is_launch_offer_active,
     is_useful_cached_result,
     now_utc,
-    reset_launch_offer,
     set_app_setting,
-    start_launch_offer,
     user_can_make_request,
     user_has_active_paid_plan,
     user_has_trial_available,
@@ -65,72 +63,6 @@ router = Router()
 logger = logging.getLogger(__name__)
 PROCESS_STARTED_AT = now_utc()
 BROADCAST_SEND_DELAY_SECONDS = 0.08
-
-
-def offer_debug_text(user: User) -> str:
-    return (
-        "Offer Debug\n\n"
-        f"offer_active: {str(is_launch_offer_active(user)).lower()}\n"
-        f"started_at: {user.launch_offer_started_at}\n"
-        f"ends_at: {user.launch_offer_ends_at}"
-    )
-
-
-async def require_admin_for_offer_command(
-    message: Message,
-    session: AsyncSession,
-) -> bool:
-    if await has_secret_stats_access(session, message.from_user.id):
-        return True
-
-    await message.answer("Нет доступа.")
-    return False
-
-
-@router.message(Command("debug_offer"))
-async def debug_offer_handler(message: Message, session: AsyncSession) -> None:
-    logger.info(
-        "Offer admin command called: command=%s user_id=%s",
-        "debug_offer",
-        message.from_user.id,
-    )
-    if not await require_admin_for_offer_command(message, session):
-        return
-
-    user = await get_or_create_user(session, message.from_user)
-    await message.answer(offer_debug_text(user))
-
-
-@router.message(Command("start_my_offer"))
-async def start_my_offer_handler(message: Message, session: AsyncSession) -> None:
-    logger.info(
-        "Offer admin command called: command=%s user_id=%s",
-        "start_my_offer",
-        message.from_user.id,
-    )
-    if not await require_admin_for_offer_command(message, session):
-        return
-
-    user = await get_or_create_user(session, message.from_user)
-    start_launch_offer(user)
-    await session.commit()
-    await message.answer("Offer запущен на 24 часа.")
-
-
-@router.message(Command("reset_my_offer"))
-async def reset_my_offer_handler(message: Message, session: AsyncSession) -> None:
-    logger.info(
-        "Offer admin command called: command=%s user_id=%s",
-        "reset_my_offer",
-        message.from_user.id,
-    )
-    if not await require_admin_for_offer_command(message, session):
-        return
-
-    user = await get_or_create_user(session, message.from_user)
-    reset_launch_offer(user)
-    await session.commit()
-    await message.answer("Offer сброшен.")
 
 
 class TextEditState(StatesGroup):
@@ -837,7 +769,7 @@ async def build_health_full_text(session: AsyncSession) -> str:
 
 @router.message(Command("admin_help"))
 async def admin_help_handler(message: Message, session: AsyncSession) -> None:
-    if not await require_admin_for_offer_command(message, session):
+    if not await require_tariff_admin(message, session):
         return
 
     await message.answer(
