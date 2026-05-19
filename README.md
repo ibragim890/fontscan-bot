@@ -106,6 +106,11 @@ python -m app.main
 
 При первом запуске приложение создаст таблицы SQLite автоматически.
 
+`init_db` поддерживает SQLite и PostgreSQL. Для PostgreSQL используйте
+`DATABASE_URL` вида `postgresql+asyncpg://user:password@host:5432/dbname`.
+Миграционные проверки колонок выбирают SQL по dialect: SQLite использует
+`PRAGMA table_info`, PostgreSQL использует `information_schema.columns`.
+
 ## Railway Deploy
 
 1. Создайте GitHub repo.

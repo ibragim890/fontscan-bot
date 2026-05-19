@@ -4,7 +4,7 @@ import logging
 from typing import Any
 
 from aiogram import BaseMiddleware
-from sqlalchemy import text
+from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
@@ -24,6 +24,55 @@ async_session_factory = async_sessionmaker(
     expire_on_commit=False,
     autoflush=False,
 )
+
+
+def database_dialect() -> str:
+    return engine.url.get_backend_name()
+
+
+def quote_sqlite_identifier(identifier: str) -> str:
+    if not identifier.replace("_", "").isalnum():
+        raise ValueError("Invalid SQL identifier")
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+async def get_table_columns(conn: Any, table_name: str) -> set[str]:
+    dialect = database_dialect()
+    if dialect == "sqlite":
+        result = await conn.execute(
+            text(f"PRAGMA table_info({quote_sqlite_identifier(table_name)})")
+        )
+        return {row[1] for row in result.fetchall()}
+
+    if dialect == "postgresql":
+        result = await conn.execute(
+            text(
+                "SELECT column_name "
+                "FROM information_schema.columns "
+                "WHERE table_name = :table_name "
+                "AND table_schema = current_schema()"
+            ),
+            {"table_name": table_name},
+        )
+        return {row[0] for row in result.fetchall()}
+
+    def inspect_columns(sync_conn: Any) -> set[str]:
+        inspector = inspect(sync_conn)
+        return {column["name"] for column in inspector.get_columns(table_name)}
+
+    return await conn.run_sync(inspect_columns)
+
+
+def datetime_column_type() -> str:
+    if database_dialect() == "postgresql":
+        return "TIMESTAMP WITH TIME ZONE"
+    return "DATETIME"
+
+
+def boolean_not_null_default_column_type(default: bool = False) -> str:
+    if database_dialect() == "postgresql":
+        return f"BOOLEAN DEFAULT {'TRUE' if default else 'FALSE'} NOT NULL"
+    return f"BOOLEAN DEFAULT {1 if default else 0} NOT NULL"
 
 
 async def force_rub_payment_ui_texts(db: Any) -> None:
@@ -96,16 +145,17 @@ async def force_rub_payment_ui_texts(db: Any) -> None:
 async def init_db() -> None:
     import app.models  # noqa: F401
 
-    logger.info("Database init started")
+    dialect = database_dialect()
+    logger.info("Database init started: dialect=%s", dialect)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        columns = await conn.execute(text("PRAGMA table_info(font_requests)"))
-        column_names = {row[1] for row in columns.fetchall()}
+        column_names = await get_table_columns(conn, "font_requests")
         if "is_cached_response" not in column_names:
             await conn.execute(
                 text(
                     "ALTER TABLE font_requests "
-                    "ADD COLUMN is_cached_response BOOLEAN DEFAULT 0 NOT NULL"
+                    "ADD COLUMN is_cached_response "
+                    f"{boolean_not_null_default_column_type()}"
                 )
             )
         if "result_type" not in column_names:
@@ -119,26 +169,26 @@ async def init_db() -> None:
             await conn.execute(
                 text(
                     "ALTER TABLE font_requests "
-                    "ADD COLUMN provider_success BOOLEAN DEFAULT 0 NOT NULL"
+                    "ADD COLUMN provider_success "
+                    f"{boolean_not_null_default_column_type()}"
                 )
             )
 
-        user_columns = await conn.execute(text("PRAGMA table_info(users)"))
-        user_column_names = {row[1] for row in user_columns.fetchall()}
+        user_column_names = await get_table_columns(conn, "users")
         user_columns_to_add = {
             "source": "VARCHAR(255)",
             "referred_by": "VARCHAR(255)",
-            "first_photo_at": "DATETIME",
-            "paywall_hit_at": "DATETIME",
-            "payment_opened_at": "DATETIME",
+            "first_photo_at": datetime_column_type(),
+            "paywall_hit_at": datetime_column_type(),
+            "payment_opened_at": datetime_column_type(),
             "recognition_balance": "INTEGER DEFAULT 0 NOT NULL",
-            "launch_offer_started_at": "DATETIME",
-            "launch_offer_ends_at": "DATETIME",
-            "launch_offer_purchased": "BOOLEAN DEFAULT 0 NOT NULL",
-            "launch_offer_reminder_6h_sent": "BOOLEAN DEFAULT 0 NOT NULL",
-            "launch_offer_reminder_12h_sent": "BOOLEAN DEFAULT 0 NOT NULL",
-            "launch_offer_reminder_18h_sent": "BOOLEAN DEFAULT 0 NOT NULL",
-            "launch_offer_reminder_24h_sent": "BOOLEAN DEFAULT 0 NOT NULL",
+            "launch_offer_started_at": datetime_column_type(),
+            "launch_offer_ends_at": datetime_column_type(),
+            "launch_offer_purchased": boolean_not_null_default_column_type(),
+            "launch_offer_reminder_6h_sent": boolean_not_null_default_column_type(),
+            "launch_offer_reminder_12h_sent": boolean_not_null_default_column_type(),
+            "launch_offer_reminder_18h_sent": boolean_not_null_default_column_type(),
+            "launch_offer_reminder_24h_sent": boolean_not_null_default_column_type(),
         }
         for column_name, column_type in user_columns_to_add.items():
             if column_name not in user_column_names:
@@ -146,16 +196,14 @@ async def init_db() -> None:
                     text(f"ALTER TABLE users ADD COLUMN {column_name} {column_type}")
                 )
 
-        external_intent_columns = await conn.execute(
-            text("PRAGMA table_info(external_payment_intents)")
+        external_intent_column_names = await get_table_columns(
+            conn,
+            "external_payment_intents",
         )
-        external_intent_column_names = {
-            row[1] for row in external_intent_columns.fetchall()
-        }
         external_intent_columns_to_add = {
             "recognitions_count": "INTEGER",
-            "offer_broadcast_sent_at": "DATETIME",
-            "offer_broadcast_clicked_at": "DATETIME",
+            "offer_broadcast_sent_at": datetime_column_type(),
+            "offer_broadcast_clicked_at": datetime_column_type(),
         }
         for column_name, column_type in external_intent_columns_to_add.items():
             if column_name not in external_intent_column_names:
@@ -165,6 +213,17 @@ async def init_db() -> None:
                         f"ADD COLUMN {column_name} {column_type}"
                     )
                 )
+
+        for table_name in (
+            "payments",
+            "recognition_packages",
+            "recognition_transactions",
+        ):
+            logger.info(
+                "Database table column check: table=%s columns=%s",
+                table_name,
+                len(await get_table_columns(conn, table_name)),
+            )
 
         await conn.execute(
             text(
@@ -218,7 +277,7 @@ async def init_db() -> None:
                     "INSERT INTO tariffs "
                     "(code, title, price_stars, monthly_limit, is_active, "
                     "created_at, updated_at) "
-                    "SELECT :code, :title, :price_stars, :monthly_limit, 1, "
+                    "SELECT :code, :title, :price_stars, :monthly_limit, :is_active, "
                     ":created_at, :updated_at "
                     "WHERE NOT EXISTS ("
                     "SELECT 1 FROM tariffs WHERE code = :code"
@@ -229,6 +288,7 @@ async def init_db() -> None:
                     "title": title,
                     "price_stars": price_stars,
                     "monthly_limit": monthly_limit,
+                    "is_active": True,
                     "created_at": now,
                     "updated_at": now,
                 },
@@ -244,7 +304,8 @@ async def init_db() -> None:
                     "INSERT INTO tariffs "
                     "(code, title, price_stars, monthly_limit, is_active, "
                     "created_at, updated_at) "
-                    "SELECT :code, :title, :price_rub, :recognitions_count, 1, "
+                    "SELECT :code, :title, :price_rub, :recognitions_count, "
+                    ":is_active, "
                     ":created_at, :updated_at "
                     "WHERE NOT EXISTS ("
                     "SELECT 1 FROM tariffs WHERE code = :code"
@@ -255,6 +316,7 @@ async def init_db() -> None:
                     "title": title,
                     "price_rub": price_rub,
                     "recognitions_count": recognitions_count,
+                    "is_active": True,
                     "created_at": now,
                     "updated_at": now,
                 },
@@ -263,7 +325,8 @@ async def init_db() -> None:
                 text(
                     "UPDATE tariffs "
                     "SET title = :title, price_stars = :price_rub, "
-                    "monthly_limit = :recognitions_count, is_active = 1, "
+                    "monthly_limit = :recognitions_count, "
+                    "is_active = :is_active, "
                     "updated_at = :updated_at "
                     "WHERE code = :code"
                 ),
@@ -272,6 +335,7 @@ async def init_db() -> None:
                     "title": title,
                     "price_rub": price_rub,
                     "recognitions_count": recognitions_count,
+                    "is_active": True,
                     "updated_at": now,
                 },
             )
