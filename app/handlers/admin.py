@@ -785,7 +785,13 @@ def offer_debug_text(user: User) -> str:
         "Offer Debug\n\n"
         f"offer_active: {str(is_launch_offer_active(user)).lower()}\n"
         f"started_at: {user.launch_offer_started_at}\n"
-        f"ends_at: {user.launch_offer_ends_at}"
+        f"ends_at: {user.launch_offer_ends_at}\n"
+        f"purchased: {str(bool(user.launch_offer_purchased)).lower()}\n"
+        f"reminder_6h: {str(bool(user.launch_offer_reminder_6h_sent)).lower()}\n"
+        f"reminder_12h: {str(bool(user.launch_offer_reminder_12h_sent)).lower()}\n"
+        f"reminder_18h: {str(bool(user.launch_offer_reminder_18h_sent)).lower()}\n"
+        f"reminder_24h: {str(bool(user.launch_offer_reminder_24h_sent)).lower()}\n"
+        f"hours_left: {get_launch_offer_hours_left(user)}"
     )
 
 
@@ -808,6 +814,10 @@ async def admin_help_handler(message: Message, session: AsyncSession) -> None:
 
 @router.message(Command("debug_offer"))
 async def debug_offer_handler(message: Message, session: AsyncSession) -> None:
+    logger.info(
+        "Offer admin command called: command=debug_offer user_id=%s",
+        message.from_user.id,
+    )
     if not await require_admin_for_offer_command(message, session):
         return
 
@@ -817,21 +827,31 @@ async def debug_offer_handler(message: Message, session: AsyncSession) -> None:
 
 @router.message(Command("start_my_offer"))
 async def start_my_offer_handler(message: Message, session: AsyncSession) -> None:
+    logger.info(
+        "Offer admin command called: command=start_my_offer user_id=%s",
+        message.from_user.id,
+    )
     if not await require_admin_for_offer_command(message, session):
         return
 
     user = await get_or_create_user(session, message.from_user)
     start_launch_offer(user)
+    await session.commit()
     await message.answer("Offer запущен на 24 часа.")
 
 
 @router.message(Command("reset_my_offer"))
 async def reset_my_offer_handler(message: Message, session: AsyncSession) -> None:
+    logger.info(
+        "Offer admin command called: command=reset_my_offer user_id=%s",
+        message.from_user.id,
+    )
     if not await require_admin_for_offer_command(message, session):
         return
 
     user = await get_or_create_user(session, message.from_user)
     reset_launch_offer(user)
+    await session.commit()
     await message.answer("Offer сброшен.")
 
 
