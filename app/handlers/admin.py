@@ -61,10 +61,76 @@ from app.texts import (
     set_bot_text,
 )
 
-router = Router(name="admin")
+router = Router()
 logger = logging.getLogger(__name__)
 PROCESS_STARTED_AT = now_utc()
 BROADCAST_SEND_DELAY_SECONDS = 0.08
+
+
+def offer_debug_text(user: User) -> str:
+    return (
+        "Offer Debug\n\n"
+        f"offer_active: {str(is_launch_offer_active(user)).lower()}\n"
+        f"started_at: {user.launch_offer_started_at}\n"
+        f"ends_at: {user.launch_offer_ends_at}"
+    )
+
+
+async def require_admin_for_offer_command(
+    message: Message,
+    session: AsyncSession,
+) -> bool:
+    if await has_secret_stats_access(session, message.from_user.id):
+        return True
+
+    await message.answer("Нет доступа.")
+    return False
+
+
+@router.message(Command("debug_offer"))
+async def debug_offer_handler(message: Message, session: AsyncSession) -> None:
+    logger.info(
+        "Offer admin command called: command=%s user_id=%s",
+        "debug_offer",
+        message.from_user.id,
+    )
+    if not await require_admin_for_offer_command(message, session):
+        return
+
+    user = await get_or_create_user(session, message.from_user)
+    await message.answer(offer_debug_text(user))
+
+
+@router.message(Command("start_my_offer"))
+async def start_my_offer_handler(message: Message, session: AsyncSession) -> None:
+    logger.info(
+        "Offer admin command called: command=%s user_id=%s",
+        "start_my_offer",
+        message.from_user.id,
+    )
+    if not await require_admin_for_offer_command(message, session):
+        return
+
+    user = await get_or_create_user(session, message.from_user)
+    start_launch_offer(user)
+    await session.commit()
+    await message.answer("Offer запущен на 24 часа.")
+
+
+@router.message(Command("reset_my_offer"))
+async def reset_my_offer_handler(message: Message, session: AsyncSession) -> None:
+    logger.info(
+        "Offer admin command called: command=%s user_id=%s",
+        "reset_my_offer",
+        message.from_user.id,
+    )
+    if not await require_admin_for_offer_command(message, session):
+        return
+
+    user = await get_or_create_user(session, message.from_user)
+    reset_launch_offer(user)
+    await session.commit()
+    await message.answer("Offer сброшен.")
 
 
 class TextEditState(StatesGroup):
@@ -769,32 +835,6 @@ async def build_health_full_text(session: AsyncSession) -> str:
     )
 
 
-async def require_admin_for_offer_command(
-    message: Message,
-    session: AsyncSession,
-) -> bool:
-    if await has_secret_stats_access(session, message.from_user.id):
-        return True
-
-    await message.answer("Нет доступа.")
-    return False
-
-
-def offer_debug_text(user: User) -> str:
-    return (
-        "Offer Debug\n\n"
-        f"offer_active: {str(is_launch_offer_active(user)).lower()}\n"
-        f"started_at: {user.launch_offer_started_at}\n"
-        f"ends_at: {user.launch_offer_ends_at}\n"
-        f"purchased: {str(bool(user.launch_offer_purchased)).lower()}\n"
-        f"reminder_6h: {str(bool(user.launch_offer_reminder_6h_sent)).lower()}\n"
-        f"reminder_12h: {str(bool(user.launch_offer_reminder_12h_sent)).lower()}\n"
-        f"reminder_18h: {str(bool(user.launch_offer_reminder_18h_sent)).lower()}\n"
-        f"reminder_24h: {str(bool(user.launch_offer_reminder_24h_sent)).lower()}\n"
-        f"hours_left: {get_launch_offer_hours_left(user)}"
-    )
-
-
 @router.message(Command("admin_help"))
 async def admin_help_handler(message: Message, session: AsyncSession) -> None:
     if not await require_admin_for_offer_command(message, session):
@@ -810,49 +850,6 @@ async def admin_help_handler(message: Message, session: AsyncSession) -> None:
         "/packages\n"
         "/secret_stats"
     )
-
-
-@router.message(Command("debug_offer"))
-async def debug_offer_handler(message: Message, session: AsyncSession) -> None:
-    logger.info(
-        "Offer admin command called: command=debug_offer user_id=%s",
-        message.from_user.id,
-    )
-    if not await require_admin_for_offer_command(message, session):
-        return
-
-    user = await get_or_create_user(session, message.from_user)
-    await message.answer(offer_debug_text(user))
-
-
-@router.message(Command("start_my_offer"))
-async def start_my_offer_handler(message: Message, session: AsyncSession) -> None:
-    logger.info(
-        "Offer admin command called: command=start_my_offer user_id=%s",
-        message.from_user.id,
-    )
-    if not await require_admin_for_offer_command(message, session):
-        return
-
-    user = await get_or_create_user(session, message.from_user)
-    start_launch_offer(user)
-    await session.commit()
-    await message.answer("Offer запущен на 24 часа.")
-
-
-@router.message(Command("reset_my_offer"))
-async def reset_my_offer_handler(message: Message, session: AsyncSession) -> None:
-    logger.info(
-        "Offer admin command called: command=reset_my_offer user_id=%s",
-        message.from_user.id,
-    )
-    if not await require_admin_for_offer_command(message, session):
-        return
-
-    user = await get_or_create_user(session, message.from_user)
-    reset_launch_offer(user)
-    await session.commit()
-    await message.answer("Offer сброшен.")
 
 
 @router.message(Command("admin_login"))
