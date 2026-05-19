@@ -7,7 +7,7 @@ from urllib.parse import parse_qs
 
 from aiogram import Bot, Dispatcher
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from sqlalchemy import select
 import uvicorn
 
@@ -197,13 +197,16 @@ async def robokassa_result(request: Request) -> PlainTextResponse:
                 intent.status = "paid"
                 intent.provider_invoice_id = inv_id_raw
                 intent.paid_at = now_utc()
+                recognitions_to_grant = (
+                    intent.recognitions_count or plan.recognitions_count
+                )
 
                 try:
                     if plan.code in PACKAGE_TARIFF_CODES:
                         grant_paid_recognitions(
                             user,
                             plan.code,
-                            plan.recognitions_count,
+                            recognitions_to_grant,
                         )
                     else:
                         activate_plan(user, plan.code, plan.monthly_limit)
@@ -221,7 +224,7 @@ async def robokassa_result(request: Request) -> PlainTextResponse:
                 await session.commit()
                 telegram_id = intent.telegram_id
                 tariff_title = plan.title
-                recognitions_count = plan.recognitions_count
+                recognitions_count = recognitions_to_grant
                 is_package_payment = plan.code in PACKAGE_TARIFF_CODES
         except Exception:
             logger.exception("Robokassa result DB processing failed")
@@ -257,6 +260,46 @@ async def robokassa_result(request: Request) -> PlainTextResponse:
     except Exception:
         logger.exception("Robokassa result endpoint failed")
         return PlainTextResponse("internal error")
+
+
+@web_app.get("/offer-broadcast/payment/{intent_id}", response_model=None)
+async def offer_broadcast_payment_click(
+    intent_id: int,
+):
+    try:
+        async with async_session_factory() as session:
+            intent = await session.get(ExternalPaymentIntent, intent_id)
+            if intent is None or intent.provider != "robokassa" or not intent.invoice_url:
+                logger.warning(
+                    "Offer broadcast payment link not found: intent_id=%s",
+                    intent_id,
+                )
+                return PlainTextResponse("payment link not found", status_code=404)
+
+            now = now_utc()
+            if intent.offer_broadcast_clicked_at is None:
+                intent.offer_broadcast_clicked_at = now
+
+            user_result = await session.execute(
+                select(User).where(User.telegram_id == intent.telegram_id)
+            )
+            user = user_result.scalar_one_or_none()
+            if user is not None:
+                user.payment_opened_at = now
+
+            await session.commit()
+            logger.info(
+                "Offer broadcast payment clicked: intent_id=%s user=%s",
+                intent.id,
+                intent.telegram_id,
+            )
+            return RedirectResponse(intent.invoice_url, status_code=302)
+    except Exception:
+        logger.exception(
+            "Offer broadcast payment click failed: intent_id=%s",
+            intent_id,
+        )
+        return PlainTextResponse("internal error", status_code=500)
 
 
 @web_app.get("/robokassa/success")

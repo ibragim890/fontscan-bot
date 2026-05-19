@@ -217,6 +217,19 @@ def card_payment_keyboard(invoice_url: str) -> InlineKeyboardMarkup:
     )
 
 
+def offer_broadcast_payment_keyboard(payment_url: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🟢 Купить за 99 ₽",
+                    url=payment_url,
+                )
+            ]
+        ]
+    )
+
+
 def admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -363,6 +376,56 @@ def broadcast_confirm_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="Отмена",
                     callback_data="broadcast:cancel",
+                )
+            ],
+        ]
+    )
+
+
+def broadcast_offer_audience_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Всем",
+                    callback_data="broadcast_offer:all",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Только free",
+                    callback_data="broadcast_offer:free",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Только без баланса",
+                    callback_data="broadcast_offer:no_balance",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Отмена",
+                    callback_data="broadcast_offer:cancel",
+                )
+            ],
+        ]
+    )
+
+
+def broadcast_offer_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Отправить",
+                    callback_data="broadcast_offer:send",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Отмена",
+                    callback_data="broadcast_offer:cancel",
                 )
             ],
         ]

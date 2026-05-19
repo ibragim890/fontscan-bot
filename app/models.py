@@ -107,9 +107,18 @@ class ExternalPaymentIntent(Base):
     telegram_id: Mapped[int] = mapped_column(BigInteger, index=True)
     tariff: Mapped[str] = mapped_column(String(32))
     amount_rub: Mapped[int] = mapped_column(Integer)
+    recognitions_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="pending")
     invoice_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     provider_invoice_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    offer_broadcast_sent_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    offer_broadcast_clicked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

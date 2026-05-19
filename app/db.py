@@ -146,6 +146,26 @@ async def init_db() -> None:
                     text(f"ALTER TABLE users ADD COLUMN {column_name} {column_type}")
                 )
 
+        external_intent_columns = await conn.execute(
+            text("PRAGMA table_info(external_payment_intents)")
+        )
+        external_intent_column_names = {
+            row[1] for row in external_intent_columns.fetchall()
+        }
+        external_intent_columns_to_add = {
+            "recognitions_count": "INTEGER",
+            "offer_broadcast_sent_at": "DATETIME",
+            "offer_broadcast_clicked_at": "DATETIME",
+        }
+        for column_name, column_type in external_intent_columns_to_add.items():
+            if column_name not in external_intent_column_names:
+                await conn.execute(
+                    text(
+                        "ALTER TABLE external_payment_intents "
+                        f"ADD COLUMN {column_name} {column_type}"
+                    )
+                )
+
         await conn.execute(
             text(
                 "UPDATE users "

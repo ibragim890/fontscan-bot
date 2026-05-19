@@ -26,6 +26,9 @@ logger = logging.getLogger(__name__)
 SUBSCRIPTION_PERIOD_SECONDS = settings.subscription_period
 STARS_CURRENCY = "XTR"
 SUBSCRIPTION_EXPORT_MISSING = "SUBSCRIPTION_EXPORT_MISSING"
+OFFER_BROADCAST_TARIFF_CODE = "founder_offer"
+OFFER_BROADCAST_AMOUNT_RUB = 99
+OFFER_BROADCAST_RECOGNITIONS = 50
 
 
 @dataclass(frozen=True)
@@ -297,6 +300,13 @@ def make_robokassa_payment_url(
     return f"{settings.robokassa_base_url.strip()}?{urlencode(params)}"
 
 
+def make_offer_broadcast_click_url(intent: ExternalPaymentIntent) -> str:
+    public_base_url = settings.public_base_url.strip().rstrip("/")
+    if not public_base_url:
+        return intent.invoice_url or ""
+    return f"{public_base_url}/offer-broadcast/payment/{intent.id}"
+
+
 def verify_robokassa_result_signature(
     out_sum: str,
     inv_id: str,
@@ -372,6 +382,7 @@ async def create_robokassa_payment(
         telegram_id=telegram_id,
         tariff=plan.code,
         amount_rub=price_rub,
+        recognitions_count=plan.recognitions_count,
         status="pending",
     )
     session.add(intent)
@@ -381,6 +392,38 @@ async def create_robokassa_payment(
     intent.invoice_url = payment_url
     await session.flush()
     return payment_url
+
+
+async def create_offer_broadcast_payment(
+    session: AsyncSession,
+    telegram_id: int,
+) -> tuple[ExternalPaymentIntent, str]:
+    if not robokassa_payment_available():
+        raise RobokassaPaymentUnavailableError("Robokassa payment is unavailable")
+
+    plan = await get_tariff(
+        session,
+        OFFER_BROADCAST_TARIFF_CODE,
+        active_only=False,
+    )
+    if plan is None:
+        raise ValueError("Unknown offer tariff")
+
+    intent = ExternalPaymentIntent(
+        provider="robokassa",
+        telegram_id=telegram_id,
+        tariff=OFFER_BROADCAST_TARIFF_CODE,
+        amount_rub=OFFER_BROADCAST_AMOUNT_RUB,
+        recognitions_count=OFFER_BROADCAST_RECOGNITIONS,
+        status="pending",
+    )
+    session.add(intent)
+    await session.flush()
+
+    payment_url = make_robokassa_payment_url(intent, plan.title)
+    intent.invoice_url = payment_url
+    await session.flush()
+    return intent, make_offer_broadcast_click_url(intent)
 
 
 async def create_payment_intent(

@@ -2,10 +2,12 @@ import asyncio
 import csv
 import io
 import logging
+import random
 from datetime import timedelta
 from pathlib import Path
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -34,6 +36,9 @@ from app.db import force_rub_payment_ui_texts
 from app.keyboards import (
     broadcast_audience_keyboard,
     broadcast_confirm_keyboard,
+    broadcast_offer_audience_keyboard,
+    broadcast_offer_confirm_keyboard,
+    offer_broadcast_payment_keyboard,
     subscription_menu_keyboard,
     text_after_save_keyboard,
     text_category_keyboard,
@@ -49,7 +54,12 @@ from app.models import (
     Tariff as TariffModel,
     User,
 )
-from app.payments import list_tariffs, robokassa_debug_lines
+from app.payments import (
+    create_offer_broadcast_payment,
+    list_tariffs,
+    robokassa_debug_lines,
+    robokassa_payment_available,
+)
 from app.texts import (
     DEFAULT_BOT_TEXTS,
     get_bot_text,
@@ -63,6 +73,8 @@ router = Router()
 logger = logging.getLogger(__name__)
 PROCESS_STARTED_AT = now_utc()
 BROADCAST_SEND_DELAY_SECONDS = 0.08
+OFFER_BROADCAST_SEND_DELAY_MIN_SECONDS = 0.05
+OFFER_BROADCAST_SEND_DELAY_MAX_SECONDS = 0.1
 
 
 class TextEditState(StatesGroup):
@@ -72,6 +84,12 @@ class TextEditState(StatesGroup):
 class BroadcastState(StatesGroup):
     waiting_text = State()
     waiting_photo = State()
+    waiting_audience = State()
+    waiting_confirm = State()
+
+
+class BroadcastOfferState(StatesGroup):
+    waiting_text = State()
     waiting_audience = State()
     waiting_confirm = State()
 
@@ -780,6 +798,7 @@ async def admin_help_handler(message: Message, session: AsyncSession) -> None:
         "/debug_access\n"
         "/debug_payments\n"
         "/packages\n"
+        "/broadcast_offer\n"
         "/secret_stats"
     )
 
@@ -1011,9 +1030,31 @@ async def broadcast_photo_handler(
     )
 
 
+@router.message(Command("broadcast_offer"))
+async def broadcast_offer_handler(
+    message: Message,
+    session: AsyncSession,
+    state: FSMContext,
+) -> None:
+    if not await require_tariff_admin(message, session):
+        return
+
+    if not robokassa_payment_available():
+        await message.answer("Оплата картой временно недоступна.")
+        return
+
+    await state.clear()
+    await state.set_state(BroadcastOfferState.waiting_text)
+    await message.answer(
+        "Введите текст offer-рассылки.\n\n"
+        "Для отмены: /cancel_broadcast"
+    )
+
+
 @router.message(Command("cancel_broadcast"))
 async def cancel_broadcast_handler(message: Message, state: FSMContext) -> None:
-    if (await state.get_state() or "").startswith("BroadcastState:"):
+    current_state = await state.get_state() or ""
+    if current_state.startswith(("BroadcastState:", "BroadcastOfferState:")):
         await state.clear()
         await message.answer("Рассылка отменена.")
         return
@@ -1084,6 +1125,228 @@ async def broadcast_photo_received_handler(
 @router.message(BroadcastState.waiting_photo, F.text, ~F.text.startswith("/"))
 async def broadcast_photo_expected_handler(message: Message) -> None:
     await message.answer("Отправьте фото для рассылки или /cancel_broadcast.")
+
+
+def build_offer_broadcast_preview_text(text: str) -> str:
+    return (
+        "Предпросмотр offer-рассылки:\n\n"
+        f"{text}\n\n"
+        "Будет добавлена кнопка:\n"
+        "🟢 Купить за 99 ₽\n\n"
+        "Кому отправить?"
+    )
+
+
+@router.message(BroadcastOfferState.waiting_text, F.text, ~F.text.startswith("/"))
+async def broadcast_offer_text_received_handler(
+    message: Message,
+    session: AsyncSession,
+    state: FSMContext,
+) -> None:
+    if not await require_tariff_admin(message, session):
+        await state.clear()
+        return
+
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("Отправьте непустой текст offer-рассылки.")
+        return
+
+    preview_text = build_offer_broadcast_preview_text(text)
+    try:
+        await message.answer(
+            preview_text,
+            reply_markup=broadcast_offer_audience_keyboard(),
+            parse_mode="HTML",
+        )
+    except TelegramBadRequest as exc:
+        logger.warning(
+            "Offer broadcast preview rejected: admin=%s error=%s",
+            message.from_user.id,
+            str(exc),
+        )
+        await message.answer(
+            "Telegram не принял HTML-разметку текста. "
+            "Проверьте теги и отправьте текст ещё раз."
+        )
+        return
+
+    await state.update_data(text=text)
+    await state.set_state(BroadcastOfferState.waiting_audience)
+
+
+@router.message(BroadcastOfferState.waiting_text, F.photo)
+@router.message(BroadcastOfferState.waiting_text, F.document)
+async def broadcast_offer_text_expected_handler(message: Message) -> None:
+    await message.answer("Отправьте текст offer-рассылки или /cancel_broadcast.")
+
+
+def offer_audience_title(audience: str) -> str:
+    titles = {
+        "all": "Всем",
+        "free": "Только free",
+        "no_balance": "Только без баланса",
+    }
+    return titles.get(audience, audience)
+
+
+async def get_offer_broadcast_user_ids(
+    session: AsyncSession,
+    audience: str,
+) -> list[int]:
+    now = now_utc()
+    query = select(User.telegram_id).order_by(User.id)
+    if audience == "free":
+        query = query.where(free_user_condition(now))
+    elif audience == "no_balance":
+        query = query.where(User.recognition_balance <= 0)
+    elif audience != "all":
+        return []
+
+    result = await session.execute(query)
+    return [telegram_id for telegram_id in result.scalars().all() if telegram_id]
+
+
+@router.callback_query(F.data == "broadcast_offer:cancel")
+async def broadcast_offer_cancel_callback(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    state: FSMContext,
+) -> None:
+    if not await require_text_admin_callback(callback, session):
+        await state.clear()
+        return
+
+    await state.clear()
+    await callback.message.answer("Offer-рассылка отменена.")
+    await callback.answer()
+
+
+@router.callback_query(
+    BroadcastOfferState.waiting_audience,
+    F.data.in_(
+        {
+            "broadcast_offer:all",
+            "broadcast_offer:free",
+            "broadcast_offer:no_balance",
+        }
+    ),
+)
+async def broadcast_offer_audience_callback(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    state: FSMContext,
+) -> None:
+    if not await require_text_admin_callback(callback, session):
+        await state.clear()
+        return
+
+    audience = callback.data.rsplit(":", maxsplit=1)[1]
+    user_ids = await get_offer_broadcast_user_ids(session, audience)
+    await state.update_data(audience=audience)
+    await state.set_state(BroadcastOfferState.waiting_confirm)
+    await callback.message.answer(
+        "Отправить offer-рассылку?\n"
+        f"Получателей: {len(user_ids)}",
+        reply_markup=broadcast_offer_confirm_keyboard(),
+    )
+    await callback.answer()
+
+
+async def sleep_offer_broadcast_delay() -> None:
+    await asyncio.sleep(
+        random.uniform(
+            OFFER_BROADCAST_SEND_DELAY_MIN_SECONDS,
+            OFFER_BROADCAST_SEND_DELAY_MAX_SECONDS,
+        )
+    )
+
+
+@router.callback_query(
+    BroadcastOfferState.waiting_confirm,
+    F.data == "broadcast_offer:send",
+)
+async def broadcast_offer_send_callback(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    state: FSMContext,
+) -> None:
+    if not await require_text_admin_callback(callback, session):
+        await state.clear()
+        return
+
+    if not robokassa_payment_available():
+        await state.clear()
+        await callback.answer(
+            "Оплата картой временно недоступна.",
+            show_alert=True,
+        )
+        return
+
+    data = await state.get_data()
+    text = data.get("text")
+    audience = data.get("audience")
+    if not isinstance(text, str) or not text:
+        await state.clear()
+        await callback.message.answer("Текст не найден. Offer-рассылка отменена.")
+        await callback.answer()
+        return
+    if not isinstance(audience, str):
+        await state.clear()
+        await callback.message.answer("Аудитория не выбрана. Offer-рассылка отменена.")
+        await callback.answer()
+        return
+
+    user_ids = await get_offer_broadcast_user_ids(session, audience)
+    await callback.message.answer(
+        "Offer-рассылка запущена.\n"
+        f"Аудитория: {offer_audience_title(audience)}\n"
+        f"Получателей: {len(user_ids)}"
+    )
+    await callback.answer()
+
+    sent = 0
+    failed = 0
+    for telegram_id in user_ids:
+        try:
+            intent, payment_url = await create_offer_broadcast_payment(
+                session,
+                telegram_id,
+            )
+            await session.commit()
+            await callback.bot.send_message(
+                telegram_id,
+                text,
+                reply_markup=offer_broadcast_payment_keyboard(payment_url),
+                parse_mode="HTML",
+            )
+            intent.offer_broadcast_sent_at = now_utc()
+            await session.commit()
+            sent += 1
+        except Exception as exc:
+            failed += 1
+            await session.rollback()
+            logger.exception(
+                "Offer broadcast delivery failed: admin=%s user=%s error=%s",
+                callback.from_user.id,
+                telegram_id,
+                exc.__class__.__name__,
+            )
+        await sleep_offer_broadcast_delay()
+
+    await state.clear()
+    logger.info(
+        "Offer broadcast finished: admin=%s audience=%s sent=%s failed=%s",
+        callback.from_user.id,
+        audience,
+        sent,
+        failed,
+    )
+    await callback.message.answer(
+        "Offer-рассылка завершена.\n\n"
+        f"Отправлено: {sent}\n"
+        f"Ошибок: {failed}"
+    )
 
 
 def audience_title(audience: str) -> str:
