@@ -430,3 +430,175 @@ def broadcast_offer_confirm_keyboard() -> InlineKeyboardMarkup:
             ],
         ]
     )
+
+
+def broadcast_builder_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Создать рассылку",
+                    callback_data="broadcast_builder:create",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Отмена",
+                    callback_data="broadcast_builder:cancel",
+                )
+            ],
+        ]
+    )
+
+
+def broadcast_builder_button_choice_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Без кнопки",
+                    callback_data="broadcast_btn:none",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="URL-кнопка",
+                    callback_data="broadcast_btn:url",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Robokassa-кнопка",
+                    callback_data="broadcast_btn:robokassa",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Готово",
+                    callback_data="broadcast_btn:done",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Отмена",
+                    callback_data="broadcast_btn:cancel",
+                )
+            ],
+        ]
+    )
+
+
+def broadcast_builder_packages_keyboard(
+    packages: list[tuple[str, str, int, int]],
+) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=f"{title} — {price_rub} ₽ / {recognitions_count} распознаваний",
+                callback_data=f"broadcast_pkg:{code}",
+            )
+        ]
+        for code, title, price_rub, recognitions_count in packages
+    ]
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="Отмена",
+                callback_data="broadcast_btn:cancel",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def broadcast_builder_preview_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Отправить тест себе",
+                    callback_data="broadcast_preview:test",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Выбрать аудиторию",
+                    callback_data="broadcast_preview:audience",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Изменить заново",
+                    callback_data="broadcast_preview:restart",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Отмена",
+                    callback_data="broadcast_preview:cancel",
+                )
+            ],
+        ]
+    )
+
+
+def broadcast_builder_audience_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Всем",
+                    callback_data="broadcast_audience:all",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Без баланса",
+                    callback_data="broadcast_audience:no_balance",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="С балансом",
+                    callback_data="broadcast_audience:has_balance",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Не покупали",
+                    callback_data="broadcast_audience:never_paid",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Отмена",
+                    callback_data="broadcast_audience:cancel",
+                )
+            ],
+        ]
+    )
+
+
+def broadcast_builder_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Отправить",
+                    callback_data="broadcast_confirm:send",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Назад",
+                    callback_data="broadcast_confirm:back",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Отмена",
+                    callback_data="broadcast_confirm:cancel",
+                )
+            ],
+        ]
+    )

@@ -1,5 +1,6 @@
 import asyncio
 import csv
+import html
 import io
 import logging
 import random
@@ -7,11 +8,18 @@ from datetime import timedelta
 from pathlib import Path
 
 from aiogram import F, Router
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import BufferedInputFile, CallbackQuery, FSInputFile, Message
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 from sqlalchemy import and_, desc, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -35,6 +43,12 @@ from app.config import settings
 from app.db import force_rub_payment_ui_texts
 from app.keyboards import (
     broadcast_audience_keyboard,
+    broadcast_builder_audience_keyboard,
+    broadcast_builder_button_choice_keyboard,
+    broadcast_builder_confirm_keyboard,
+    broadcast_builder_menu_keyboard,
+    broadcast_builder_packages_keyboard,
+    broadcast_builder_preview_keyboard,
     broadcast_confirm_keyboard,
     broadcast_offer_audience_keyboard,
     broadcast_offer_confirm_keyboard,
@@ -51,10 +65,12 @@ from app.models import (
     ExternalPayment,
     FontRequest,
     Payment,
+    RecognitionPackage,
     Tariff as TariffModel,
     User,
 )
 from app.payments import (
+    create_broadcast_package_payment,
     create_offer_broadcast_payment,
     list_tariffs,
     robokassa_debug_lines,
@@ -90,6 +106,17 @@ class BroadcastState(StatesGroup):
 
 class BroadcastOfferState(StatesGroup):
     waiting_text = State()
+    waiting_audience = State()
+    waiting_confirm = State()
+
+
+class BroadcastBuilder(StatesGroup):
+    waiting_text = State()
+    waiting_button_choice = State()
+    waiting_url_button_text = State()
+    waiting_url_button_url = State()
+    waiting_robokassa_package = State()
+    waiting_robokassa_button_text = State()
     waiting_audience = State()
     waiting_confirm = State()
 
@@ -798,6 +825,9 @@ async def admin_help_handler(message: Message, session: AsyncSession) -> None:
         "/debug_access\n"
         "/debug_payments\n"
         "/packages\n"
+        "/broadcast_menu\n"
+        "/broadcast\n"
+        "/broadcast_photo\n"
         "/broadcast_offer\n"
         "/debug_broadcast_recipients\n"
         "/secret_stats"
@@ -997,6 +1027,821 @@ async def export_users_handler(message: Message, session: AsyncSession) -> None:
     )
 
 
+def default_broadcast_robokassa_button_text(package_code: str) -> str:
+    defaults = {
+        "founder_offer": "🟢 Купить за 99 ₽",
+        "founder_regular": "Купить за 199 ₽",
+    }
+    return defaults.get(package_code, "Купить")
+
+
+def normalize_broadcast_buttons(raw_buttons: object) -> list[dict[str, str]]:
+    if not isinstance(raw_buttons, list):
+        return []
+
+    buttons: list[dict[str, str]] = []
+    for raw_button in raw_buttons:
+        if not isinstance(raw_button, dict):
+            continue
+        button_type = raw_button.get("type")
+        text = raw_button.get("text")
+        if button_type not in {"url", "robokassa"} or not isinstance(text, str):
+            continue
+
+        button: dict[str, str] = {
+            "type": button_type,
+            "text": text,
+        }
+        if button_type == "url":
+            url = raw_button.get("url")
+            if not isinstance(url, str):
+                continue
+            button["url"] = url
+        else:
+            package_code = raw_button.get("package_code")
+            if not isinstance(package_code, str):
+                continue
+            button["package_code"] = package_code
+        buttons.append(button)
+    return buttons[:3]
+
+
+def has_broadcast_robokassa_button(buttons: list[dict[str, str]]) -> bool:
+    return any(button.get("type") == "robokassa" for button in buttons)
+
+
+async def show_broadcast_builder_text_step(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await state.update_data(buttons=[])
+    await state.set_state(BroadcastBuilder.waiting_text)
+    await message.answer(
+        "Отправьте текст рассылки.\n\n"
+        "Можно использовать HTML:\n"
+        "<b>жирный</b>\n"
+        "<i>курсив</i>\n"
+        "<s>старая цена</s>\n\n"
+        "Для отмены: /cancel_broadcast"
+    )
+
+
+async def show_broadcast_builder_button_choice(
+    message: Message,
+    state: FSMContext,
+    *,
+    prompt: str = "Добавить кнопку?",
+) -> None:
+    await state.set_state(BroadcastBuilder.waiting_button_choice)
+    data = await state.get_data()
+    buttons = normalize_broadcast_buttons(data.get("buttons"))
+    suffix = ""
+    if buttons:
+        suffix = f"\n\nСейчас кнопок: {len(buttons)} / 3"
+    await message.answer(
+        f"{prompt}{suffix}",
+        reply_markup=broadcast_builder_button_choice_keyboard(),
+    )
+
+
+def build_broadcast_builder_preview_text(
+    text: str,
+    buttons: list[dict[str, str]],
+) -> str:
+    lines = [
+        "Предпросмотр рассылки:",
+        "",
+        text,
+        "",
+        "Кнопки:",
+    ]
+    if buttons:
+        for index, button in enumerate(buttons, start=1):
+            button_text = html.escape(button["text"])
+            if button["type"] == "url":
+                lines.append(f"{index}. {button_text} — URL")
+            else:
+                package_code = html.escape(button["package_code"])
+                lines.append(f"{index}. {button_text} — Robokassa: {package_code}")
+    else:
+        lines.append("нет")
+
+    if has_broadcast_robokassa_button(buttons):
+        lines.extend(
+            [
+                "",
+                "Robokassa-ссылка будет создана персонально для каждого пользователя.",
+            ]
+        )
+    return "\n".join(lines)
+
+
+async def send_broadcast_builder_preview_message(
+    message: Message,
+    state: FSMContext,
+) -> bool:
+    data = await state.get_data()
+    text = data.get("text")
+    buttons = normalize_broadcast_buttons(data.get("buttons"))
+    if not isinstance(text, str) or not text:
+        await state.set_state(BroadcastBuilder.waiting_text)
+        await message.answer("Текст не найден. Отправьте текст рассылки.")
+        return False
+
+    preview_text = build_broadcast_builder_preview_text(text, buttons)
+    try:
+        await message.answer(
+            preview_text,
+            reply_markup=broadcast_builder_preview_keyboard(),
+            parse_mode="HTML",
+        )
+    except TelegramBadRequest as exc:
+        logger.warning(
+            "Broadcast builder preview rejected: admin=%s error=%s",
+            message.from_user.id,
+            str(exc),
+        )
+        await state.set_state(BroadcastBuilder.waiting_text)
+        await message.answer("HTML в тексте некорректный. Исправьте текст.")
+        return False
+
+    return True
+
+
+async def build_broadcast_delivery_keyboard(
+    session: AsyncSession,
+    telegram_id: int,
+    buttons: list[dict[str, str]],
+) -> InlineKeyboardMarkup | None:
+    rows: list[list[InlineKeyboardButton]] = []
+    for button in buttons:
+        if button["type"] == "url":
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=button["text"],
+                        url=button["url"],
+                    )
+                ]
+            )
+            continue
+
+        _intent, payment_url = await create_broadcast_package_payment(
+            session,
+            telegram_id,
+            button["package_code"],
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=button["text"],
+                    url=payment_url,
+                )
+            ]
+        )
+
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
+async def list_active_broadcast_packages(
+    session: AsyncSession,
+) -> list[RecognitionPackage]:
+    result = await session.execute(
+        select(RecognitionPackage)
+        .where(RecognitionPackage.is_active.is_(True))
+        .order_by(RecognitionPackage.id)
+    )
+    return list(result.scalars().all())
+
+
+@router.message(Command("broadcast_menu"))
+async def broadcast_menu_handler(
+    message: Message,
+    session: AsyncSession,
+    state: FSMContext,
+) -> None:
+    if not await require_tariff_admin(message, session):
+        return
+
+    await state.clear()
+    await message.answer(
+        "Рассылки\n\n"
+        "Выберите действие:",
+        reply_markup=broadcast_builder_menu_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "broadcast_builder:create")
+async def broadcast_builder_create_callback(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    state: FSMContext,
+) -> None:
+    if not await require_text_admin_callback(callback, session):
+        await state.clear()
+        return
+
+    await show_broadcast_builder_text_step(callback.message, state)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "broadcast_builder:cancel")
+async def broadcast_builder_menu_cancel_callback(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    state: FSMContext,
+) -> None:
+    if not await require_text_admin_callback(callback, session):
+        await state.clear()
+        return
+
+    await state.clear()
+    await callback.message.answer("Рассылка отменена.")
+    await callback.answer()
+
+
+@router.message(BroadcastBuilder.waiting_text, F.text, ~F.text.startswith("/"))
+async def broadcast_builder_text_received_handler(
+    message: Message,
+    session: AsyncSession,
+    state: FSMContext,
+) -> None:
+    if not await require_tariff_admin(message, session):
+        await state.clear()
+        return
+
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("Отправьте непустой текст рассылки.")
+        return
+
+    data = await state.get_data()
+    buttons = normalize_broadcast_buttons(data.get("buttons"))
+    await state.update_data(text=text, buttons=buttons)
+    await show_broadcast_builder_button_choice(message, state)
+
+
+@router.callback_query(
+    BroadcastBuilder.waiting_button_choice,
+    F.data.in_(
+        {
+            "broadcast_btn:none",
+            "broadcast_btn:url",
+            "broadcast_btn:robokassa",
+            "broadcast_btn:done",
+            "broadcast_btn:cancel",
+        }
+    ),
+)
+async def broadcast_builder_button_choice_callback(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    state: FSMContext,
+) -> None:
+    if not await require_text_admin_callback(callback, session):
+        await state.clear()
+        return
+
+    action = callback.data.rsplit(":", maxsplit=1)[1]
+    if action == "cancel":
+        await state.clear()
+        await callback.message.answer("Рассылка отменена.")
+        await callback.answer()
+        return
+
+    data = await state.get_data()
+    buttons = normalize_broadcast_buttons(data.get("buttons"))
+    if action == "none":
+        await state.update_data(buttons=[])
+        if await send_broadcast_builder_preview_message(callback.message, state):
+            await state.set_state(BroadcastBuilder.waiting_confirm)
+        await callback.answer()
+        return
+
+    if action == "done":
+        if await send_broadcast_builder_preview_message(callback.message, state):
+            await state.set_state(BroadcastBuilder.waiting_confirm)
+        await callback.answer()
+        return
+
+    if len(buttons) >= 3:
+        await callback.answer("Максимум 3 кнопки.", show_alert=True)
+        return
+
+    if action == "url":
+        await state.set_state(BroadcastBuilder.waiting_url_button_text)
+        await callback.message.answer(
+            "Введите текст кнопки.\n\n"
+            "Пример:\n"
+            "Открыть бота"
+        )
+        await callback.answer()
+        return
+
+    if has_broadcast_robokassa_button(buttons):
+        await callback.answer("Можно добавить только одну Robokassa-кнопку.", show_alert=True)
+        return
+    if not robokassa_payment_available():
+        await callback.answer("Оплата картой временно недоступна.", show_alert=True)
+        return
+
+    packages = await list_active_broadcast_packages(session)
+    if not packages:
+        await callback.answer("Активных пакетов нет.", show_alert=True)
+        return
+
+    await state.set_state(BroadcastBuilder.waiting_robokassa_package)
+    await callback.message.answer(
+        "Выберите пакет:",
+        reply_markup=broadcast_builder_packages_keyboard(
+            [
+                (
+                    package.code,
+                    package.title,
+                    package.price_rub,
+                    package.recognitions_count,
+                )
+                for package in packages
+            ]
+        ),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "broadcast_btn:cancel")
+async def broadcast_builder_button_cancel_callback(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    state: FSMContext,
+) -> None:
+    if not await require_text_admin_callback(callback, session):
+        await state.clear()
+        return
+
+    current_state = await state.get_state() or ""
+    if not current_state.startswith("BroadcastBuilder:"):
+        await callback.answer()
+        return
+
+    await state.clear()
+    await callback.message.answer("Рассылка отменена.")
+    await callback.answer()
+
+
+@router.message(BroadcastBuilder.waiting_url_button_text, F.text, ~F.text.startswith("/"))
+async def broadcast_builder_url_button_text_handler(
+    message: Message,
+    session: AsyncSession,
+    state: FSMContext,
+) -> None:
+    if not await require_tariff_admin(message, session):
+        await state.clear()
+        return
+
+    button_text = (message.text or "").strip()
+    if not button_text:
+        await message.answer("Введите непустой текст кнопки.")
+        return
+
+    await state.update_data(pending_url_button_text=button_text)
+    await state.set_state(BroadcastBuilder.waiting_url_button_url)
+    await message.answer(
+        "Введите URL.\n\n"
+        "Пример:\n"
+        "https://t.me/whatfontopusfont_bot"
+    )
+
+
+@router.message(BroadcastBuilder.waiting_url_button_url, F.text, ~F.text.startswith("/"))
+async def broadcast_builder_url_button_url_handler(
+    message: Message,
+    session: AsyncSession,
+    state: FSMContext,
+) -> None:
+    if not await require_tariff_admin(message, session):
+        await state.clear()
+        return
+
+    url = (message.text or "").strip()
+    if not (url.startswith("http://") or url.startswith("https://")):
+        await message.answer("URL должен начинаться с http:// или https://.")
+        return
+
+    data = await state.get_data()
+    button_text = data.get("pending_url_button_text")
+    if not isinstance(button_text, str) or not button_text:
+        await state.set_state(BroadcastBuilder.waiting_url_button_text)
+        await message.answer("Текст кнопки не найден. Введите текст кнопки ещё раз.")
+        return
+
+    buttons = normalize_broadcast_buttons(data.get("buttons"))
+    if len(buttons) >= 3:
+        await show_broadcast_builder_button_choice(
+            message,
+            state,
+            prompt="Максимум 3 кнопки. Можно завершить рассылку.",
+        )
+        return
+
+    buttons.append(
+        {
+            "type": "url",
+            "text": button_text,
+            "url": url,
+        }
+    )
+    await state.update_data(buttons=buttons, pending_url_button_text=None)
+    await show_broadcast_builder_button_choice(message, state, prompt="Добавить ещё кнопку?")
+
+
+@router.callback_query(
+    BroadcastBuilder.waiting_robokassa_package,
+    F.data.startswith("broadcast_pkg:"),
+)
+async def broadcast_builder_package_callback(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    state: FSMContext,
+) -> None:
+    if not await require_text_admin_callback(callback, session):
+        await state.clear()
+        return
+
+    package_code = callback.data.split(":", maxsplit=1)[1]
+    result = await session.execute(
+        select(RecognitionPackage).where(
+            RecognitionPackage.code == package_code,
+            RecognitionPackage.is_active.is_(True),
+        )
+    )
+    package = result.scalar_one_or_none()
+    if package is None:
+        await callback.answer("Пакет не найден или выключен.", show_alert=True)
+        return
+
+    data = await state.get_data()
+    buttons = normalize_broadcast_buttons(data.get("buttons"))
+    if len(buttons) >= 3:
+        await callback.answer("Максимум 3 кнопки.", show_alert=True)
+        return
+    if has_broadcast_robokassa_button(buttons):
+        await callback.answer("Можно добавить только одну Robokassa-кнопку.", show_alert=True)
+        return
+
+    await state.update_data(pending_robokassa_package_code=package.code)
+    await state.set_state(BroadcastBuilder.waiting_robokassa_button_text)
+    await callback.message.answer(
+        "Введите текст кнопки.\n\n"
+        "По умолчанию можно написать:\n"
+        f"{default_broadcast_robokassa_button_text(package.code)}\n\n"
+        "Если хотите использовать дефолт, отправьте -"
+    )
+    await callback.answer()
+
+
+@router.message(BroadcastBuilder.waiting_robokassa_button_text, F.text, ~F.text.startswith("/"))
+async def broadcast_builder_robokassa_button_text_handler(
+    message: Message,
+    session: AsyncSession,
+    state: FSMContext,
+) -> None:
+    if not await require_tariff_admin(message, session):
+        await state.clear()
+        return
+
+    data = await state.get_data()
+    package_code = data.get("pending_robokassa_package_code")
+    if not isinstance(package_code, str) or not package_code:
+        await state.set_state(BroadcastBuilder.waiting_robokassa_package)
+        await message.answer("Пакет не найден. Выберите Robokassa-пакет ещё раз.")
+        return
+
+    buttons = normalize_broadcast_buttons(data.get("buttons"))
+    if len(buttons) >= 3:
+        await show_broadcast_builder_button_choice(
+            message,
+            state,
+            prompt="Максимум 3 кнопки. Можно завершить рассылку.",
+        )
+        return
+    if has_broadcast_robokassa_button(buttons):
+        await show_broadcast_builder_button_choice(
+            message,
+            state,
+            prompt="Robokassa-кнопка уже добавлена.",
+        )
+        return
+
+    raw_text = (message.text or "").strip()
+    button_text = (
+        default_broadcast_robokassa_button_text(package_code)
+        if raw_text in {"", "-"}
+        else raw_text
+    )
+    buttons.append(
+        {
+            "type": "robokassa",
+            "text": button_text,
+            "package_code": package_code,
+        }
+    )
+    await state.update_data(buttons=buttons, pending_robokassa_package_code=None)
+    await show_broadcast_builder_button_choice(message, state, prompt="Добавить ещё кнопку?")
+
+
+@router.callback_query(
+    BroadcastBuilder.waiting_confirm,
+    F.data.in_(
+        {
+            "broadcast_preview:test",
+            "broadcast_preview:audience",
+            "broadcast_preview:restart",
+            "broadcast_preview:cancel",
+        }
+    ),
+)
+async def broadcast_builder_preview_callback(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    state: FSMContext,
+) -> None:
+    if not await require_text_admin_callback(callback, session):
+        await state.clear()
+        return
+
+    action = callback.data.rsplit(":", maxsplit=1)[1]
+    if action == "cancel":
+        await state.clear()
+        await callback.message.answer("Рассылка отменена.")
+        await callback.answer()
+        return
+
+    if action == "restart":
+        await show_broadcast_builder_text_step(callback.message, state)
+        await callback.answer()
+        return
+
+    data = await state.get_data()
+    text = data.get("text")
+    buttons = normalize_broadcast_buttons(data.get("buttons"))
+    if not isinstance(text, str) or not text:
+        await state.clear()
+        await callback.message.answer("Текст не найден. Рассылка отменена.")
+        await callback.answer()
+        return
+
+    if action == "audience":
+        await state.set_state(BroadcastBuilder.waiting_audience)
+        await callback.message.answer(
+            "Кому отправить?",
+            reply_markup=broadcast_builder_audience_keyboard(),
+        )
+        await callback.answer()
+        return
+
+    try:
+        reply_markup = await build_broadcast_delivery_keyboard(
+            session,
+            callback.from_user.id,
+            buttons,
+        )
+        await session.commit()
+        await callback.bot.send_message(
+            callback.from_user.id,
+            text,
+            reply_markup=reply_markup,
+            parse_mode="HTML",
+        )
+    except TelegramBadRequest as exc:
+        await session.rollback()
+        logger.warning(
+            "Broadcast builder test send rejected: admin=%s error=%s",
+            callback.from_user.id,
+            str(exc),
+        )
+        await state.set_state(BroadcastBuilder.waiting_text)
+        await callback.message.answer("HTML в тексте некорректный. Исправьте текст.")
+        await callback.answer()
+        return
+    except Exception as exc:
+        await session.rollback()
+        logger.exception(
+            "Broadcast builder test send failed: admin=%s error=%s",
+            callback.from_user.id,
+            exc.__class__.__name__,
+        )
+        await callback.answer("Тестовую рассылку не удалось отправить.", show_alert=True)
+        return
+
+    await callback.message.answer("Тестовая рассылка отправлена.")
+    await callback.answer()
+
+
+def broadcast_builder_audience_title(audience: str) -> str:
+    titles = {
+        "all": "Всем",
+        "no_balance": "Без баланса",
+        "has_balance": "С балансом",
+        "never_paid": "Не покупали",
+    }
+    return titles.get(audience, audience)
+
+
+async def get_broadcast_builder_user_ids(
+    session: AsyncSession,
+    audience: str,
+) -> list[int]:
+    query = select(User.telegram_id).where(User.telegram_id.is_not(None)).order_by(User.id)
+    if audience == "no_balance":
+        query = query.where(func.coalesce(User.recognition_balance, 0) <= 0)
+    elif audience == "has_balance":
+        query = query.where(User.recognition_balance > 0)
+    elif audience == "never_paid":
+        has_stars_payment = (
+            select(Payment.id)
+            .where(Payment.telegram_id == User.telegram_id)
+            .exists()
+        )
+        has_external_payment = (
+            select(ExternalPayment.id)
+            .where(ExternalPayment.telegram_id == User.telegram_id)
+            .exists()
+        )
+        query = query.where(~has_stars_payment, ~has_external_payment)
+    elif audience != "all":
+        return []
+
+    result = await session.execute(query)
+    return [telegram_id for telegram_id in result.scalars().all() if telegram_id]
+
+
+def first_broadcast_builder_ids_text(user_ids: list[int]) -> str:
+    first_ids = user_ids[:10]
+    if not first_ids:
+        return "нет"
+    return "\n".join(f"- {telegram_id}" for telegram_id in first_ids)
+
+
+@router.callback_query(
+    BroadcastBuilder.waiting_audience,
+    F.data.startswith("broadcast_audience:"),
+)
+async def broadcast_builder_audience_callback(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    state: FSMContext,
+) -> None:
+    if not await require_text_admin_callback(callback, session):
+        await state.clear()
+        return
+
+    audience = callback.data.rsplit(":", maxsplit=1)[1]
+    if audience == "cancel":
+        await state.clear()
+        await callback.message.answer("Рассылка отменена.")
+        await callback.answer()
+        return
+
+    user_ids = await get_broadcast_builder_user_ids(session, audience)
+    if not user_ids:
+        await state.set_state(BroadcastBuilder.waiting_audience)
+        await callback.message.answer(
+            "Подходящих пользователей не найдено.",
+            reply_markup=broadcast_builder_audience_keyboard(),
+        )
+        await callback.answer()
+        return
+
+    await state.update_data(audience=audience)
+    await state.set_state(BroadcastBuilder.waiting_confirm)
+    await callback.message.answer(
+        "Отправить рассылку?\n\n"
+        f"Аудитория: {broadcast_builder_audience_title(audience)}\n"
+        f"Получателей: {len(user_ids)}\n\n"
+        "Первые ID:\n"
+        f"{first_broadcast_builder_ids_text(user_ids)}",
+        reply_markup=broadcast_builder_confirm_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(
+    BroadcastBuilder.waiting_confirm,
+    F.data.in_(
+        {
+            "broadcast_confirm:send",
+            "broadcast_confirm:back",
+            "broadcast_confirm:cancel",
+        }
+    ),
+)
+async def broadcast_builder_confirm_callback(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    state: FSMContext,
+) -> None:
+    if not await require_text_admin_callback(callback, session):
+        await state.clear()
+        return
+
+    action = callback.data.rsplit(":", maxsplit=1)[1]
+    if action == "cancel":
+        await state.clear()
+        await callback.message.answer("Рассылка отменена.")
+        await callback.answer()
+        return
+
+    if action == "back":
+        await state.set_state(BroadcastBuilder.waiting_audience)
+        await callback.message.answer(
+            "Кому отправить?",
+            reply_markup=broadcast_builder_audience_keyboard(),
+        )
+        await callback.answer()
+        return
+
+    data = await state.get_data()
+    text = data.get("text")
+    audience = data.get("audience")
+    buttons = normalize_broadcast_buttons(data.get("buttons"))
+    if not isinstance(text, str) or not text:
+        await state.clear()
+        await callback.message.answer("Текст не найден. Рассылка отменена.")
+        await callback.answer()
+        return
+    if not isinstance(audience, str):
+        await state.clear()
+        await callback.message.answer("Аудитория не выбрана. Рассылка отменена.")
+        await callback.answer()
+        return
+
+    user_ids = await get_broadcast_builder_user_ids(session, audience)
+    if not user_ids:
+        await state.set_state(BroadcastBuilder.waiting_audience)
+        await callback.message.answer(
+            "Подходящих пользователей не найдено.",
+            reply_markup=broadcast_builder_audience_keyboard(),
+        )
+        await callback.answer()
+        return
+
+    await callback.message.answer(
+        "Рассылка запущена.\n"
+        f"Аудитория: {broadcast_builder_audience_title(audience)}\n"
+        f"Получателей: {len(user_ids)}"
+    )
+    await callback.answer()
+
+    sent = 0
+    failed = 0
+    for telegram_id in user_ids:
+        try:
+            reply_markup = await build_broadcast_delivery_keyboard(
+                session,
+                telegram_id,
+                buttons,
+            )
+            await session.commit()
+            await callback.bot.send_message(
+                telegram_id,
+                text,
+                reply_markup=reply_markup,
+                parse_mode="HTML",
+            )
+            sent += 1
+        except TelegramAPIError as exc:
+            failed += 1
+            await session.rollback()
+            logger.warning(
+                "Broadcast builder Telegram delivery failed: admin=%s user=%s error=%s",
+                callback.from_user.id,
+                telegram_id,
+                str(exc),
+            )
+        except Exception as exc:
+            failed += 1
+            await session.rollback()
+            logger.exception(
+                "Broadcast builder delivery failed: admin=%s user=%s error=%s",
+                callback.from_user.id,
+                telegram_id,
+                exc.__class__.__name__,
+            )
+        await sleep_offer_broadcast_delay()
+
+    await state.clear()
+    logger.info(
+        "Broadcast builder finished: admin=%s audience=%s sent=%s failed=%s",
+        callback.from_user.id,
+        audience,
+        sent,
+        failed,
+    )
+    await callback.message.answer(
+        "Рассылка завершена.\n\n"
+        f"Отправлено: {sent}\n"
+        f"Ошибок: {failed}"
+    )
+
+
 @router.message(Command("broadcast"))
 async def broadcast_handler(
     message: Message,
@@ -1055,7 +1900,9 @@ async def broadcast_offer_handler(
 @router.message(Command("cancel_broadcast"))
 async def cancel_broadcast_handler(message: Message, state: FSMContext) -> None:
     current_state = await state.get_state() or ""
-    if current_state.startswith(("BroadcastState:", "BroadcastOfferState:")):
+    if current_state.startswith(
+        ("BroadcastState:", "BroadcastOfferState:", "BroadcastBuilder:")
+    ):
         await state.clear()
         await message.answer("Рассылка отменена.")
         return
@@ -1254,19 +2101,21 @@ async def debug_broadcast_recipients_handler(
         )
         or 0
     )
-    all_user_ids = await get_offer_broadcast_user_ids(session, "all")
-    free_user_ids = await get_offer_broadcast_user_ids(session, "free")
-    no_balance_user_ids = await get_offer_broadcast_user_ids(session, "no_balance")
+    all_user_ids = await get_broadcast_builder_user_ids(session, "all")
+    no_balance_user_ids = await get_broadcast_builder_user_ids(session, "no_balance")
+    has_balance_user_ids = await get_broadcast_builder_user_ids(session, "has_balance")
+    never_paid_user_ids = await get_broadcast_builder_user_ids(session, "never_paid")
 
     await message.answer(
         "Broadcast Recipients Debug\n\n"
         f"total users: {total_users}\n"
         f"users with telegram_id: {users_with_telegram_id}\n"
-        f"all recipients count: {len(all_user_ids)}\n"
-        f"free recipients count: {len(free_user_ids)}\n"
-        f"no_balance recipients count: {len(no_balance_user_ids)}\n\n"
+        f"all count: {len(all_user_ids)}\n"
+        f"no_balance count: {len(no_balance_user_ids)}\n"
+        f"has_balance count: {len(has_balance_user_ids)}\n"
+        f"never_paid count: {len(never_paid_user_ids)}\n\n"
         "Первые 10 telegram_id:\n"
-        f"{first_recipient_ids_text(all_user_ids)}"
+        f"{first_broadcast_builder_ids_text(all_user_ids)}"
     )
 
 

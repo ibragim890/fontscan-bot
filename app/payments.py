@@ -18,6 +18,7 @@ from app.models import (
     ExternalPaymentIntent,
     Payment,
     PaymentIntent,
+    RecognitionPackage,
     Tariff as TariffModel,
     User,
 )
@@ -424,6 +425,46 @@ async def create_offer_broadcast_payment(
     intent.invoice_url = payment_url
     await session.flush()
     return intent, make_offer_broadcast_click_url(intent)
+
+
+async def create_broadcast_package_payment(
+    session: AsyncSession,
+    telegram_id: int,
+    package_code: str,
+) -> tuple[ExternalPaymentIntent, str]:
+    if not robokassa_payment_available():
+        raise RobokassaPaymentUnavailableError("Robokassa payment is unavailable")
+
+    normalized_code = package_code.lower().strip()
+    result = await session.execute(
+        select(RecognitionPackage).where(
+            RecognitionPackage.code == normalized_code,
+            RecognitionPackage.is_active.is_(True),
+        )
+    )
+    package = result.scalar_one_or_none()
+    if package is None:
+        raise ValueError("Unknown recognition package")
+
+    plan = await get_tariff(session, package.code, active_only=False)
+    if plan is None:
+        raise ValueError("Recognition package tariff is missing")
+
+    intent = ExternalPaymentIntent(
+        provider="robokassa",
+        telegram_id=telegram_id,
+        tariff=package.code,
+        amount_rub=package.price_rub,
+        recognitions_count=package.recognitions_count,
+        status="pending",
+    )
+    session.add(intent)
+    await session.flush()
+
+    payment_url = make_robokassa_payment_url(intent, package.title)
+    intent.invoice_url = payment_url
+    await session.flush()
+    return intent, payment_url
 
 
 async def create_payment_intent(

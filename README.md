@@ -369,6 +369,15 @@ Font provider возвращает `success`, `counted_as_usage` и `result_type
 
 `/broadcast_photo` работает так же, но принимает фото и optional caption.
 
+`/broadcast_menu` открывает новый broadcast builder в Telegram:
+
+- HTML-текст рассылки;
+- до 3 вертикальных кнопок;
+- обычные URL-кнопки;
+- одна Robokassa-кнопка с персональной ссылкой для каждого получателя;
+- preview, тестовая отправка себе, выбор аудитории и confirm перед массовой отправкой;
+- аудитории `all`, `no_balance`, `has_balance`, `never_paid`.
+
 `/broadcast_offer` запускает отдельную offer-рассылку:
 
 - бот просит текст рассылки;
@@ -445,6 +454,7 @@ telegram_id,username,source,created_at,plan,plan_ends_at,trial_requests_used,mon
 - `/funnels` — воронка Start → Photo → Paywall → Payment → Paid.
 - `/user_stats` — пользователи всего, сегодня, 7d, 30d, paid, trial available/exhausted.
 - `/api_usage` — дневной usage WhatFontIs по ключам и safety limit без вывода самих ключей.
+- `/broadcast_menu` — broadcast builder: HTML-текст, URL/Robokassa-кнопки, preview, test send, audience и confirm.
 - `/broadcast` — текстовая рассылка по `all`, `free` или `paid` после preview и confirm.
 - `/broadcast_photo` — рассылка фото с caption по `all`, `free` или `paid`.
 - `/broadcast_offer` — offer-рассылка с персональной кнопкой Robokassa `🟢 Купить за 99 ₽`.
